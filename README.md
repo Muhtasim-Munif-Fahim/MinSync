@@ -175,7 +175,7 @@ authoritative rescan is required.
 
 | id | Strategy | Boundary stability under edits |
 |---|---|---|
-| `recursive` (default) | paragraph to sentence to line splits merged to a size budget | an edit near the top of a file can shift downstream boundaries |
+| `recursive` (default) | paragraph to sentence to line splits merged to a size budget; markdown table rows that fit the budget are never split mid-row | an edit near the top of a file can shift downstream boundaries |
 | `chonkie` | delimiter/size-based chonkie-core chunking | same drift caveat as `recursive` |
 | `cdc` | content-defined chunking with FastCDC-style rolling hash | small edits usually affect only nearby chunks |
 
