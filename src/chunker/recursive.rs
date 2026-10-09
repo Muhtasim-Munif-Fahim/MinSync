@@ -77,9 +77,10 @@ fn is_table_row(line: &str) -> bool {
 }
 
 /// Join split ranges that cut through the inside of a markdown table row so the
-/// row stays in a single piece. Rows longer than `max_chunk_size` are left
-/// alone and keep falling back to sentence splitting, so a chunk is never
-/// forced past the embedder's context by this rule.
+/// row stays in a single piece. A row is only joined when the resulting piece
+/// (including the delimiter attached to its end) fits in `max_chunk_size`;
+/// larger rows keep falling back to sentence splitting, so this rule never
+/// pushes a chunk past the embedder's context.
 ///
 /// `offsets` must be sorted, contiguous byte ranges covering `text`.
 fn keep_table_rows_whole(
@@ -87,33 +88,39 @@ fn keep_table_rows_whole(
     offsets: Vec<(usize, usize)>,
     max_chunk_size: usize,
 ) -> Vec<(usize, usize)> {
-    // Byte ranges (start, end) of protected rows, excluding the trailing newline.
-    let mut rows: Vec<(usize, usize)> = Vec::new();
+    // join_prev[i]: piece i is a continuation of piece i - 1.
+    let mut join_prev = vec![false; offsets.len()];
+    let mut any_join = false;
     let mut line_start = 0;
     for line in text.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        if is_table_row(content) && content.chars().count() <= max_chunk_size {
-            rows.push((line_start, line_start + content.len()));
-        }
+        let row_start = line_start;
         line_start += line.len();
+        if !is_table_row(line) {
+            continue;
+        }
+        let row_end = row_start + line.trim_end_matches(['\n', '\r']).len();
+        // First piece ending inside/after the row start, last piece starting before the row end.
+        let first = offsets.partition_point(|&(_, end)| end <= row_start);
+        let after = offsets.partition_point(|&(start, _)| start < row_end);
+        if first >= offsets.len() || after <= first + 1 {
+            continue;
+        }
+        let last = after - 1;
+        let (span_start, span_end) = (offsets[first].0, offsets[last].1);
+        if text[span_start..span_end].chars().count() <= max_chunk_size {
+            join_prev[first + 1..=last].fill(true);
+            any_join = true;
+        }
     }
-    if rows.is_empty() {
+    if !any_join {
         return offsets;
     }
 
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(offsets.len());
-    let mut row_idx = 0;
-    for (start, end) in offsets {
-        while row_idx < rows.len() && rows[row_idx].1 <= start {
-            row_idx += 1;
-        }
-        // The boundary between the previous split and this one sits inside a row
-        // when this split starts strictly after the row start and within the row.
-        let continues_row =
-            row_idx < rows.len() && rows[row_idx].0 < start && start < rows[row_idx].1;
+    for (piece, joined) in offsets.into_iter().zip(join_prev) {
         match merged.last_mut() {
-            Some(last) if continues_row => last.1 = end,
-            _ => merged.push((start, end)),
+            Some(last) if joined => last.1 = piece.1,
+            _ => merged.push(piece),
         }
     }
     merged
@@ -268,6 +275,50 @@ mod tests {
         let chunks = chunker.chunk(&text, "t.md").expect("chunk table");
 
         assert!(chunks.iter().any(|chunk| chunk.text.contains(&row)));
+        assert_eq!(chunks.concat_text(), text);
+    }
+
+    #[test]
+    fn test_protecting_a_row_never_pushes_a_chunk_past_max_chunk_size() {
+        // Row content is exactly max_chunk_size, so with its trailing newline it
+        // no longer fits in one chunk and must stay splittable.
+        let max = 60;
+        let body: String = "ab. ".repeat(max).chars().take(max - 4).collect();
+        let row = format!("| {body} |");
+        assert_eq!(row.chars().count(), max);
+        let text = format!("{row}\n{row}\n{row}\n");
+        let chunker = RecursiveChunker::new(max);
+
+        let chunks = chunker.chunk(&text, "t.md").expect("chunk table");
+
+        for chunk in &chunks {
+            assert!(
+                chunk.text.chars().count() <= max,
+                "chunk exceeds max_chunk_size: {chunk:?}"
+            );
+        }
+        assert_eq!(chunks.concat_text(), text);
+    }
+
+    #[test]
+    fn test_row_followed_by_blank_line_never_exceeds_max_chunk_size() {
+        // The "\n\n" delimiter is attached to the row's piece, so row + "\n\n"
+        // is what has to fit, not just the row line.
+        let max = 60;
+        let body: String = "ab. ".repeat(max).chars().take(max - 5).collect();
+        let row = format!("| {body} |");
+        assert_eq!(row.chars().count(), max - 1);
+        let text = format!("{row}\n\nnext paragraph\n\n{row}\n\n");
+        let chunker = RecursiveChunker::new(max);
+
+        let chunks = chunker.chunk(&text, "t.md").expect("chunk table");
+
+        for chunk in &chunks {
+            assert!(
+                chunk.text.chars().count() <= max,
+                "chunk exceeds max_chunk_size: {chunk:?}"
+            );
+        }
         assert_eq!(chunks.concat_text(), text);
     }
 
