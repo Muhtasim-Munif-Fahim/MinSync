@@ -69,6 +69,7 @@ fn default_sync_result_serializes_zero_chunks_truncated() {
         files_added: 0,
         files_modified: 0,
         files_deleted: 0,
+        files_resumed: 0,
         elapsed_seconds: 0.0,
         embedding_api_calls: 0,
         embedded_texts: 0,
