@@ -73,6 +73,7 @@ fn default_sync_result_serializes_zero_chunks_truncated() {
         elapsed_seconds: 0.0,
         embedding_api_calls: 0,
         embedded_texts: 0,
+        embeddings_reused: 0,
         estimated_tokens: 0,
         files_checked: 0,
         freshness_check_only: false,

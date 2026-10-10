@@ -1,10 +1,11 @@
 //! Async LanceDB operations executed on the worker thread.
 
-use super::filters::{filter_to_sql, id_in_filter};
+use super::filters::{column_in_filter, filter_to_sql, id_in_filter};
 use super::index::{compact_if_fragmented, maintain_index, maintain_scalar_indexes};
 use super::schema::{
-    batch_to_documents, batch_to_fts_hits, batch_to_query_hits, dedupe_documents, docs_to_batch,
-    schema, string_col, updates_to_batch, validate_schema, validate_vector,
+    batch_to_documents, batch_to_fts_hits, batch_to_hash_embeddings, batch_to_query_hits,
+    dedupe_documents, docs_to_batch, schema, string_col, updates_to_batch, validate_schema,
+    validate_vector,
 };
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
@@ -20,7 +21,7 @@ use lancedb::table::NewColumnTransform;
 use lancedb::table::OptimizeAction;
 use lancedb::{Connection, Table};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(super) struct LanceDbInner {
     conn: Connection,
@@ -169,6 +170,43 @@ impl LanceDbInner {
         let mut docs = self.scan_documents(Some(filter)).await?;
         docs.sort_by_key(|doc| ids.iter().position(|id| *id == doc.id).unwrap_or(ids.len()));
         Ok(docs)
+    }
+
+    /// Read only `content_hash` and the vector so reuse lookups never pull
+    /// chunk text (which can be megabytes for delimiter-less files).
+    pub(super) async fn fetch_embeddings_by_content_hash(
+        &self,
+        hashes: Vec<String>,
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        let mut found = HashMap::new();
+        if hashes.is_empty() {
+            return Ok(found);
+        }
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(column_in_filter(
+                "content_hash",
+                hashes.iter().map(String::as_str),
+            ))
+            .select(Select::Columns(vec![
+                "content_hash".to_string(),
+                VECTOR_COLUMN.to_string(),
+            ]))
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        for batch in batches {
+            for (hash, vector) in batch_to_hash_embeddings(&batch)? {
+                if vector.iter().all(|value| value.is_finite()) {
+                    found.entry(hash).or_insert(vector);
+                }
+            }
+        }
+        Ok(found)
     }
 
     pub(super) async fn documents(&self) -> Result<Vec<Document>> {

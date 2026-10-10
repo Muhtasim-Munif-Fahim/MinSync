@@ -60,6 +60,17 @@ pub trait VectorStore: Send + Sync {
     }
     fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()>;
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>>;
+    /// Return a stored embedding for each of `content_hashes` that already
+    /// exists in the store, keyed by content hash. Embeddings depend only on
+    /// chunk text (the embedder is fixed per collection), so sync reuses them
+    /// instead of re-embedding identical chunks found under other paths.
+    /// Stores that cannot look this up efficiently return an empty map.
+    fn fetch_embeddings_by_content_hash(
+        &self,
+        _content_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        Ok(std::collections::HashMap::new())
+    }
     fn documents(&self) -> Result<Vec<Document>> {
         Ok(Vec::new())
     }

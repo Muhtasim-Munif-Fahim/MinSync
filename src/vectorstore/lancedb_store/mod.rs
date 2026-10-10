@@ -199,6 +199,13 @@ impl VectorStore for LanceDbStore {
         self.request(|resp| Command::Fetch(ids.to_vec(), resp))
     }
 
+    fn fetch_embeddings_by_content_hash(
+        &self,
+        content_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        self.request(|resp| Command::FetchEmbeddingsByContentHash(content_hashes.to_vec(), resp))
+    }
+
     fn documents(&self) -> Result<Vec<Document>> {
         self.request(Command::Documents)
     }
@@ -505,6 +512,40 @@ mod tests {
                 vec![f32::INFINITY, 0.0, 0.0, 0.0]
             )])
             .is_err());
+    }
+
+    #[test]
+    fn test_fetch_embeddings_by_content_hash_returns_only_known_hashes() {
+        let (_dir, mut store) = store();
+        let mut shared = doc("b", "copy.txt", "token", vec![0.0, 1.0, 0.0, 0.0]);
+        shared.content_hash = "hash-a".to_string();
+        store
+            .upsert(&[
+                doc("a", "a.txt", "token", vec![1.0, 0.0, 0.0, 0.0]),
+                shared,
+                doc("c", "c.txt", "token", vec![0.0, 0.0, 1.0, 0.0]),
+            ])
+            .expect("upsert docs");
+
+        let found = store
+            .fetch_embeddings_by_content_hash(&[
+                "hash-a".to_string(),
+                "hash-c".to_string(),
+                "hash-missing".to_string(),
+                "it's quoted".to_string(),
+            ])
+            .expect("lookup succeeds");
+
+        assert_eq!(found.len(), 2);
+        assert_eq!(found["hash-c"], vec![0.0, 0.0, 1.0, 0.0]);
+        assert!(
+            found["hash-a"] == vec![1.0, 0.0, 0.0, 0.0]
+                || found["hash-a"] == vec![0.0, 1.0, 0.0, 0.0]
+        );
+        assert!(store
+            .fetch_embeddings_by_content_hash(&[])
+            .expect("empty lookup succeeds")
+            .is_empty());
     }
 
     #[test]

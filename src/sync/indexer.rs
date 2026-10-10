@@ -170,34 +170,75 @@ pub(super) async fn index_batch(
 
     // Embed first: the slow, fallible step runs before any write, so a
     // failure leaves the store untouched by this batch.
+    //
+    // Identical chunk text (same content hash) embeds once, and vectors the
+    // store already holds for that hash are reused. The rest go to the
+    // embedder longest first so consecutive batches pad far less.
     if !docs_to_embed.is_empty() {
-        let texts: Vec<String> = docs_to_embed.iter().map(|doc| doc.text.clone()).collect();
-        let mut embeddings = context.embedder.embed(&texts).await?;
-        if embeddings.len() != docs_to_embed.len() {
-            return Err(MinSyncError::Embedding(format!(
-                "expected {} embeddings, got {}",
-                docs_to_embed.len(),
-                embeddings.len()
-            )));
+        let mut seen_hashes: HashSet<&str> = HashSet::new();
+        let mut unique: Vec<usize> = Vec::new();
+        for (index, doc) in docs_to_embed.iter().enumerate() {
+            if seen_hashes.insert(doc.content_hash.as_str()) {
+                unique.push(index);
+            }
         }
-        repair_non_finite_embeddings(
-            context.embedder,
-            &texts,
-            &mut embeddings,
-            context.config.embedder.max_retries,
-            &docs_to_embed,
-            &chunk_in_file,
-        )
-        .await?;
-
-        result.embedding_api_calls += 1;
-        result.embedded_texts += texts.len();
-        result.estimated_tokens += texts
+        let hashes: Vec<String> = unique
             .iter()
-            .map(|text| estimate_tokens(text))
-            .sum::<usize>();
-        for (doc, embedding) in docs_to_embed.iter_mut().zip(embeddings) {
-            doc.embedding = embedding;
+            .map(|&index| docs_to_embed[index].content_hash.clone())
+            .collect();
+        let mut vectors = context.store.fetch_embeddings_by_content_hash(&hashes)?;
+
+        let mut to_embed: Vec<usize> = unique
+            .into_iter()
+            .filter(|&index| !vectors.contains_key(&docs_to_embed[index].content_hash))
+            .collect();
+        to_embed.sort_by_key(|&index| std::cmp::Reverse(docs_to_embed[index].text.len()));
+
+        if !to_embed.is_empty() {
+            let texts: Vec<String> = to_embed
+                .iter()
+                .map(|&index| docs_to_embed[index].text.clone())
+                .collect();
+            let mut embeddings = context.embedder.embed(&texts).await?;
+            if embeddings.len() != texts.len() {
+                return Err(MinSyncError::Embedding(format!(
+                    "expected {} embeddings, got {}",
+                    texts.len(),
+                    embeddings.len()
+                )));
+            }
+            let located: Vec<(&Document, usize)> = to_embed
+                .iter()
+                .map(|&index| (&docs_to_embed[index], chunk_in_file[index]))
+                .collect();
+            repair_non_finite_embeddings(
+                context.embedder,
+                &texts,
+                &mut embeddings,
+                context.config.embedder.max_retries,
+                &located,
+            )
+            .await?;
+
+            result.embedding_api_calls += 1;
+            result.embedded_texts += texts.len();
+            result.estimated_tokens += texts
+                .iter()
+                .map(|text| estimate_tokens(text))
+                .sum::<usize>();
+            for (&index, embedding) in to_embed.iter().zip(embeddings) {
+                vectors.insert(docs_to_embed[index].content_hash.clone(), embedding);
+            }
+        }
+
+        result.embeddings_reused += docs_to_embed.len() - to_embed.len();
+        for (index, doc) in docs_to_embed.iter_mut().enumerate() {
+            doc.embedding = vectors.get(&doc.content_hash).cloned().ok_or_else(|| {
+                MinSyncError::Embedding(format!(
+                    "missing embedding for {} (chunk {})",
+                    doc.path, chunk_in_file[index]
+                ))
+            })?;
         }
     }
 
@@ -256,15 +297,14 @@ async fn repair_non_finite_embeddings(
     texts: &[String],
     embeddings: &mut [Vec<f32>],
     max_retries: usize,
-    docs: &[Document],
-    chunk_in_file: &[usize],
+    located: &[(&Document, usize)],
 ) -> Result<()> {
     for index in 0..embeddings.len() {
         if is_finite_embedding(&embeddings[index]) {
             continue;
         }
-        let path = docs[index].path.as_str();
-        let chunk = chunk_in_file[index];
+        let (doc, chunk) = located[index];
+        let path = doc.path.as_str();
         let mut attempts = 0;
         while attempts < max_retries.max(1) && !is_finite_embedding(&embeddings[index]) {
             attempts += 1;
@@ -279,7 +319,7 @@ async fn repair_non_finite_embeddings(
         if !is_finite_embedding(&embeddings[index]) {
             return Err(MinSyncError::Embedding(format!(
                 "embedding for {path} (chunk {chunk}, document {}) contains non-finite values after {attempts} single-chunk retries",
-                docs[index].id
+                doc.id
             )));
         }
     }
