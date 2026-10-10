@@ -887,6 +887,22 @@ mod tests {
     }
 
     #[test]
+    fn test_existing_ids_is_not_truncated_for_large_id_lists() {
+        // A silently truncated existence check would make `insert_new`
+        // append duplicates of chunks that are already stored.
+        let (_dir, mut store) = store();
+        let docs: Vec<_> = (0..1500)
+            .map(|i| doc(&format!("id-{i}"), "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        store.upsert(&docs).expect("seed");
+        let mut ids: Vec<String> = (0..1500).map(|i| format!("id-{i}")).collect();
+        ids.push("ghost".to_string());
+        let found = store.existing_ids(&ids).expect("existing ids");
+        assert_eq!(found.len(), 1500);
+        assert!(!found.contains("ghost"));
+    }
+
+    #[test]
     fn test_insert_new_appends_in_one_commit_without_scanning() {
         let (dir, mut store) = store();
         store
