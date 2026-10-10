@@ -16,6 +16,8 @@ pub(super) enum Command {
     Update(Vec<DocumentUpdate>, Resp<()>),
     Fetch(Vec<String>, Resp<Vec<Document>>),
     Documents(Resp<Vec<Document>>),
+    ExistingIds(Vec<String>, Resp<std::collections::HashSet<String>>),
+    InsertNew(Vec<Document>, Resp<()>),
     Delete(Filter, Resp<usize>),
     Query {
         vector: Vec<f32>,
@@ -30,6 +32,8 @@ pub(super) enum Command {
         resp: Resp<Vec<QueryHit>>,
     },
     Flush(Resp<()>),
+    Checkpoint(Resp<()>),
+    FragmentCount(Resp<usize>),
     DocCount(Resp<usize>),
     AllPaths(Resp<Vec<String>>),
     IndexNames(Resp<Vec<String>>),
@@ -78,6 +82,12 @@ pub(super) fn run_worker(
             }
             Command::Fetch(ids, resp) => send_response(resp, rt.block_on(inner.fetch(ids))),
             Command::Documents(resp) => send_response(resp, rt.block_on(inner.documents())),
+            Command::ExistingIds(ids, resp) => {
+                send_response(resp, rt.block_on(inner.existing_ids(ids)))
+            }
+            Command::InsertNew(docs, resp) => {
+                send_response(resp, rt.block_on(inner.insert_new(docs)))
+            }
             Command::Delete(filter, resp) => {
                 send_response(resp, rt.block_on(inner.delete_by_filter(filter)));
             }
@@ -94,6 +104,10 @@ pub(super) fn run_worker(
                 resp,
             } => send_response(resp, rt.block_on(inner.query_text(text, filter, topk))),
             Command::Flush(resp) => send_response(resp, rt.block_on(inner.flush())),
+            Command::Checkpoint(resp) => send_response(resp, rt.block_on(inner.checkpoint())),
+            Command::FragmentCount(resp) => {
+                send_response(resp, rt.block_on(inner.fragment_count()));
+            }
             Command::DocCount(resp) => send_response(resp, rt.block_on(inner.doc_count())),
             Command::AllPaths(resp) => send_response(resp, rt.block_on(inner.all_paths())),
             Command::IndexNames(resp) => send_response(resp, rt.block_on(inner.index_names())),
