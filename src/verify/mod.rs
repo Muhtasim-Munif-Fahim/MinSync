@@ -102,7 +102,8 @@ pub async fn verify(
 }
 
 fn check_embedding_integrity(store: &dyn VectorStore) -> Result<EmbeddingIntegrityResult> {
-    let documents = store.documents()?;
+    let mut documents = store.documents()?;
+    documents.sort_by(|left, right| left.id.cmp(&right.id));
     let mut flagged_pairs = Vec::new();
 
     for (left_index, left) in documents.iter().enumerate() {
