@@ -4811,6 +4811,7 @@ dependencies = [
  "lindera",
  "lzma-sys",
  "notify-debouncer-full",
+ "parking_lot",
  "predicates",
  "protobuf-src",
  "reqwest 0.12.28",

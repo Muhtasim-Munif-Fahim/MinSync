@@ -254,6 +254,29 @@ compact_fragment_threshold = 64
 
 `minsync optimize` runs only compact + re-index + prune (no embedding, no file reads) to repair a store that earlier interrupted syncs left fragmented.
 
+### Machine-readable progress
+
+A host app that spawns `minsync sync` can read progress as JSON lines instead of parsing human logs:
+
+```bash
+minsync sync --progress jsonl                       # events on stdout, human logs on stderr
+minsync --format json sync --progress-file p.jsonl  # events to a file, result stays on stdout
+minsync sync --progress jsonl --progress-heartbeat-seconds 2
+```
+
+```jsonc
+{"event":"start","total_files":12345,"resumed":42,"full":false,"dry_run":false,"sync_token":"…"}
+{"event":"batch","processed":125,"total":12345,"path_first":"a/b.md","path_last":"a/c.md","elapsed_ms":3200}
+{"event":"heartbeat","processed":125,"total":12345,"elapsed_ms":8200}
+{"event":"done","processed":12345,"total":12345,"files_processed":12303,"files_added":12000,"files_modified":303,"files_deleted":0,"files_resumed":42,"chunks_added":…,"elapsed_seconds":1234.5}
+```
+
+- `start` precedes the first batch; one `batch` per committed batch (`processed` includes resumed files); `done` is the last event.
+- `heartbeat` is sent only after `--progress-heartbeat-seconds` (default 5) without another event, from a dedicated thread, so a slow embedding call or store commit still produces a signal. A growing `processed` means slow; an unchanged one across heartbeats means stuck on the current batch.
+- Dry runs and up-to-date runs emit `start` (`sync_token: null`) and `done` only.
+- With `--progress jsonl`, the text summary moves to stderr and `--format json` prints the final result as one compact last line on stdout. Without the flags, output is unchanged.
+- A sink that closes mid-run (host exited, disk full) is dropped with a warning and never fails the sync. An unopenable `--progress-file` fails before any work.
+
 ## Skipped files
 
 By default one bad file does not abort a sync. A file whose read, chunk, token-count or embed step fails (EACCES, EBUSY, EIO, a parser error, an embedder rejecting its text) is skipped and recorded; if a batch commit still fails, MinSync retries that batch file by file and skips only the culprit. A skipped file is never recorded as done: a new file stays out of the saved manifest and a previously indexed file keeps its previous manifest entry, so the next `minsync sync` retries it automatically. Its old chunks (if it was indexed before) stay searchable until it succeeds, including across full syncs.

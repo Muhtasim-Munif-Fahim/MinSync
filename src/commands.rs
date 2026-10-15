@@ -1,10 +1,11 @@
 //! CLI command handlers. `main.rs` stays a thin binary: parse args, set up
 //! logging, dispatch here, and map errors to exit codes.
 
-use crate::cli::{Cli, Commands, OutputFormat, QueryMode};
+use crate::cli::{Cli, Commands, OutputFormat, ProgressFormat, QueryMode};
 use crate::error::MinSyncError;
 use crate::error::Result;
 use crate::sync::MinSync;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Exit code of a sync that completed but skipped files that failed to
@@ -19,8 +20,16 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         dry_run,
         wait,
         batch_size,
+        progress,
+        progress_file,
+        progress_heartbeat_seconds,
     } = cli.command
     {
+        let progress = ProgressOptions {
+            stdout: progress == Some(ProgressFormat::Jsonl),
+            file: progress_file,
+            heartbeat: std::time::Duration::from_secs(progress_heartbeat_seconds),
+        };
         return sync(
             &cli.format,
             root,
@@ -29,6 +38,7 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
             dry_run,
             wait,
             batch_size,
+            progress,
         )
         .await;
     }
@@ -97,6 +107,36 @@ fn init(
     Ok(())
 }
 
+/// Where `minsync sync` sends its machine-readable progress stream.
+struct ProgressOptions {
+    /// `--progress jsonl`: events go to stdout.
+    stdout: bool,
+    /// `--progress-file`: events go to this file.
+    file: Option<PathBuf>,
+    heartbeat: std::time::Duration,
+}
+
+impl ProgressOptions {
+    fn reporter(&self) -> Result<Option<std::sync::Arc<crate::sync::ProgressReporter>>> {
+        let mut writers: Vec<Box<dyn std::io::Write + Send>> = Vec::new();
+        if let Some(path) = &self.file {
+            let file = std::fs::File::create(path).map_err(|error| {
+                MinSyncError::Other(format!(
+                    "cannot open progress file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            writers.push(Box::new(file));
+        }
+        if self.stdout {
+            writers.push(Box::new(std::io::stdout()));
+        }
+        Ok((!writers.is_empty()).then(|| {
+            std::sync::Arc::new(crate::sync::ProgressReporter::new(writers, self.heartbeat))
+        }))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sync(
     format: &OutputFormat,
@@ -106,9 +146,15 @@ async fn sync(
     dry_run: bool,
     wait: bool,
     batch_size: Option<usize>,
+    progress: ProgressOptions,
 ) -> Result<i32> {
     require_initialized(minsync_dir)?;
-    let ms = MinSync::new(root.clone());
+    // Fail on an unusable progress sink before taking the lock or syncing.
+    let reporter = progress.reporter()?;
+    let mut ms = MinSync::new(root.clone());
+    if let Some(reporter) = &reporter {
+        ms = ms.with_progress(reporter.clone());
+    }
     let _lock = crate::state::FileLock::acquire(&minsync_dir.join("lock"), wait)?;
     let mut config = crate::config::Config::load(&minsync_dir.join("config.toml"))?;
     if let Some(bs) = batch_size {
@@ -129,35 +175,45 @@ async fn sync(
         )
         .await?;
 
+    // stdout carries the event stream when `--progress jsonl` is on, so the
+    // human summary moves to stderr and the final JSON result becomes the
+    // last, compact line (one JSON value per line). Otherwise unchanged.
+    let events_on_stdout = progress.stdout;
+    let mut out: Box<dyn std::io::Write> = if events_on_stdout {
+        Box::new(std::io::stderr())
+    } else {
+        Box::new(std::io::stdout())
+    };
     match format {
         OutputFormat::Text => {
             if result.already_up_to_date {
-                println!("Already up to date.");
+                writeln!(out, "Already up to date.")?;
             } else if result.dry_run {
-                println!(
+                writeln!(
+                    out,
                     "Dry run: {} files would be processed",
                     result.files_processed_paths.len()
-                );
+                )?;
             } else {
                 if result.initial_sync {
-                    println!("Initial sync: no cursor found — performed full sync.");
+                    writeln!(out, "Initial sync: no cursor found — performed full sync.")?;
                 }
-                println!("Sync complete:");
-                println!("  files processed: {}", result.files_processed);
-                println!("  files added:     {}", result.files_added);
-                println!("  files modified:  {}", result.files_modified);
-                println!("  files deleted:   {}", result.files_deleted);
-                println!("  chunks inserted: {}", result.chunks_added);
-                println!("  chunks reused:   {}", result.chunks_updated);
-                println!("  chunks removed:  {}", result.chunks_deleted);
-                println!();
-                println!("Sync Stats");
-                println!("  elapsed time:        {:.2}s", result.elapsed_seconds);
-                println!("  embedding API calls: {}", result.embedding_api_calls);
-                println!("  embedded texts:      {}", result.embedded_texts);
-                println!("  embeddings reused:   {}", result.embeddings_reused);
-                println!("  chunks truncated:    {}", result.chunks_truncated);
-                println!("  estimated tokens:    {}", result.estimated_tokens);
+                writeln!(out, "Sync complete:")?;
+                writeln!(out, "  files processed: {}", result.files_processed)?;
+                writeln!(out, "  files added:     {}", result.files_added)?;
+                writeln!(out, "  files modified:  {}", result.files_modified)?;
+                writeln!(out, "  files deleted:   {}", result.files_deleted)?;
+                writeln!(out, "  chunks inserted: {}", result.chunks_added)?;
+                writeln!(out, "  chunks reused:   {}", result.chunks_updated)?;
+                writeln!(out, "  chunks removed:  {}", result.chunks_deleted)?;
+                writeln!(out)?;
+                writeln!(out, "Sync Stats")?;
+                writeln!(out, "  elapsed time:        {:.2}s", result.elapsed_seconds)?;
+                writeln!(out, "  embedding API calls: {}", result.embedding_api_calls)?;
+                writeln!(out, "  embedded texts:      {}", result.embedded_texts)?;
+                writeln!(out, "  embeddings reused:   {}", result.embeddings_reused)?;
+                writeln!(out, "  chunks truncated:    {}", result.chunks_truncated)?;
+                writeln!(out, "  estimated tokens:    {}", result.estimated_tokens)?;
             }
             if result.partial {
                 eprintln!(
@@ -170,7 +226,11 @@ async fn sync(
             }
         }
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            if events_on_stdout {
+                writeln!(std::io::stdout(), "{}", serde_json::to_string(&result)?)?;
+            } else {
+                writeln!(out, "{}", serde_json::to_string_pretty(&result)?)?;
+            }
         }
     }
     Ok(if result.partial { EXIT_PARTIAL_SYNC } else { 0 })
