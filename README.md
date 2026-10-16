@@ -260,7 +260,7 @@ A host app that spawns `minsync sync` can read progress as JSON lines instead of
 
 ```bash
 minsync sync --progress jsonl                       # events on stdout, human logs on stderr
-minsync --format json sync --progress-file p.jsonl  # events to a file, result stays on stdout
+minsync --format json sync --progress-file /tmp/p.jsonl  # events to a file, result stays on stdout
 minsync sync --progress jsonl --progress-heartbeat-seconds 2
 ```
 
@@ -275,7 +275,7 @@ minsync sync --progress jsonl --progress-heartbeat-seconds 2
 - `heartbeat` is sent only after `--progress-heartbeat-seconds` (default 5) without another event, from a dedicated thread, so a slow embedding call or store commit still produces a signal. A growing `processed` means slow; an unchanged one across heartbeats means stuck on the current batch.
 - Dry runs and up-to-date runs emit `start` (`sync_token: null`) and `done` only.
 - With `--progress jsonl`, the text summary moves to stderr and `--format json` prints the final result as one compact last line on stdout. Without the flags, output is unchanged.
-- A sink that closes mid-run (host exited, disk full) is dropped with a warning and never fails the sync. An unopenable `--progress-file` fails before any work.
+- A sink that closes mid-run (host exited, disk full) is dropped with a warning and never fails the sync. An unopenable `--progress-file` fails before any work. A `--progress-file` inside `.minsync/` (it would overwrite state such as the resume log) or inside the indexed workspace without a matching `.minsyncignore` entry (it would be indexed as a source file) is rejected before the file is touched.
 
 ## Skipped files
 

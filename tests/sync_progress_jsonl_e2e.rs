@@ -326,3 +326,46 @@ fn unwritable_progress_file_fails_before_syncing() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("progress.jsonl"));
 }
+
+#[test]
+fn progress_file_inside_state_dir_is_rejected_without_truncating_it() {
+    let root = tempfile::tempdir().unwrap();
+    let minsync_dir = root.path().join(".minsync");
+    std::fs::create_dir_all(&minsync_dir).unwrap();
+    Config::default_for("s")
+        .save(&minsync_dir.join("config.toml"))
+        .unwrap();
+    let resume_log = minsync_dir.join("progress.jsonl");
+    std::fs::write(&resume_log, "resume-state").unwrap();
+
+    let output = minsync(root.path())
+        .args(["sync", "--progress-file", ".minsync/progress.jsonl"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must not be inside .minsync"));
+    assert_eq!(
+        std::fs::read_to_string(&resume_log).unwrap(),
+        "resume-state"
+    );
+}
+
+#[test]
+fn progress_file_inside_indexed_tree_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let minsync_dir = root.path().join(".minsync");
+    std::fs::create_dir_all(&minsync_dir).unwrap();
+    Config::default_for("s")
+        .save(&minsync_dir.join("config.toml"))
+        .unwrap();
+
+    let output = minsync(root.path())
+        .args(["sync", "--progress-file", "p.jsonl"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add it to .minsyncignore"));
+    assert!(!root.path().join("p.jsonl").exists());
+}
