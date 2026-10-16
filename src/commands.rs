@@ -255,6 +255,7 @@ async fn sync(
                 writeln!(out, "  embedded texts:      {}", result.embedded_texts)?;
                 writeln!(out, "  embeddings reused:   {}", result.embeddings_reused)?;
                 writeln!(out, "  chunks truncated:    {}", result.chunks_truncated)?;
+                writeln!(out, "  scan errors:         {}", result.scan_errors.len())?;
                 writeln!(out, "  estimated tokens:    {}", result.estimated_tokens)?;
             }
             if result.partial {
@@ -273,6 +274,19 @@ async fn sync(
             } else {
                 writeln!(out, "{}", serde_json::to_string_pretty(&result)?)?;
             }
+        }
+    }
+    if matches!(format, OutputFormat::Text) {
+        // Entries already listed as skipped files above are not repeated.
+        for error in result
+            .scan_errors
+            .iter()
+            .filter(|error| !result.files_failed.iter().any(|f| f.path == error.path))
+        {
+            eprintln!(
+                "warning: scan error ({:?}) {}: {} — existing chunks kept",
+                error.kind, error.path, error.error
+            );
         }
     }
     Ok(if result.partial { EXIT_PARTIAL_SYNC } else { 0 })
