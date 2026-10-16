@@ -369,3 +369,40 @@ fn progress_file_inside_indexed_tree_is_rejected() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("add it to .minsyncignore"));
     assert!(!root.path().join("p.jsonl").exists());
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skipped_file_is_reported_as_file_failed_and_partial_done() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = embed_server(Duration::ZERO).await;
+    let root = workspace(&server, 3);
+    let locked = root.path().join("locked.md");
+    std::fs::write(&locked, "secret").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        return; // running as root: permissions do not apply
+    }
+
+    let output = minsync(root.path())
+        .args(["sync", "--progress", "jsonl"])
+        .output()
+        .expect("run sync");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(output.status.code(), Some(6), "partial sync exit code");
+    let lines = parse_lines(&String::from_utf8(output.stdout).unwrap());
+    let failed: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "file_failed")
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["path"], "locked.md");
+    assert_eq!(failed[0]["stage"], "read");
+    assert!(failed[0]["error"].as_str().unwrap().contains("Permission"));
+
+    let done = lines.last().expect("events");
+    assert_eq!(done["event"], "done");
+    assert_eq!(done["files_failed"], 1);
+    assert_eq!(done["partial"], true);
+}

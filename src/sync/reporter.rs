@@ -14,7 +14,7 @@
 //!
 //! This is unrelated to [`super::progress`], the crash-resume log.
 
-use crate::types::SyncResult;
+use crate::types::{FileFailure, FileStage, SyncResult};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::io::Write;
@@ -61,6 +61,11 @@ enum ProgressEvent<'a> {
         total: usize,
         elapsed_ms: u128,
     },
+    FileFailed {
+        path: &'a str,
+        stage: FileStage,
+        error: &'a str,
+    },
     Done {
         processed: usize,
         total: usize,
@@ -75,6 +80,8 @@ enum ProgressEvent<'a> {
         chunks_truncated: usize,
         dry_run: bool,
         already_up_to_date: bool,
+        files_failed: usize,
+        partial: bool,
         elapsed_seconds: f64,
     },
 }
@@ -193,6 +200,15 @@ impl ProgressReporter {
         }
     }
 
+    /// One skipped file (skip-and-record), emitted as soon as it is known.
+    pub(super) fn file_failed(&self, failure: &FileFailure) {
+        self.shared.lock().emit(&ProgressEvent::FileFailed {
+            path: &failure.path,
+            stage: failure.stage,
+            error: &failure.error,
+        });
+    }
+
     /// `processed` counts resumed files too, like the `total` it is
     /// compared with.
     pub(super) fn batch(&self, processed: usize, path_first: &str, path_last: &str) {
@@ -230,6 +246,8 @@ impl ProgressReporter {
             chunks_truncated: result.chunks_truncated,
             dry_run: result.dry_run,
             already_up_to_date: result.already_up_to_date,
+            files_failed: result.files_failed.len(),
+            partial: result.partial,
             elapsed_seconds: result.elapsed_seconds,
         });
     }

@@ -339,6 +339,9 @@ impl MinSync {
                     dry_run,
                     sync_token: None,
                 });
+                for failure in &scan_failures {
+                    progress.file_failed(failure);
+                }
             }
             let mut result = empty_sync_result(dry_run, true);
             result.partial = !scan_failures.is_empty();
@@ -362,6 +365,9 @@ impl MinSync {
                     dry_run: true,
                     sync_token: None,
                 });
+                for failure in &scan_failures {
+                    progress.file_failed(failure);
+                }
             }
             let files_processed_paths = changes.iter().map(change_path).collect();
             let files_added = changes
@@ -507,6 +513,9 @@ impl MinSync {
                 dry_run: false,
                 sync_token: Some(&sync_token),
             });
+            for failure in &result.files_failed {
+                progress.file_failed(failure);
+            }
         }
 
         let mut processed_this_run = 0usize;
@@ -541,6 +550,11 @@ impl MinSync {
             };
             let failed_before = result.files_failed.len();
             index_batch(&self.root, &items, context, &mut result).await?;
+            if let Some(progress) = &self.progress {
+                for failure in &result.files_failed[failed_before..] {
+                    progress.file_failed(failure);
+                }
+            }
 
             // Logged only after the store commits returned: a logged path is
             // always safe to skip on resume. One fsync for the whole batch.

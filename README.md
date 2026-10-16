@@ -267,11 +267,12 @@ minsync sync --progress jsonl --progress-heartbeat-seconds 2
 ```jsonc
 {"event":"start","total_files":12345,"resumed":42,"full":false,"dry_run":false,"sync_token":"…"}
 {"event":"batch","processed":125,"total":12345,"path_first":"a/b.md","path_last":"a/c.md","elapsed_ms":3200}
+{"event":"file_failed","path":"notes/broken.pdf","stage":"read","error":"io error: Permission denied (os error 13)"}
 {"event":"heartbeat","processed":125,"total":12345,"elapsed_ms":8200}
-{"event":"done","processed":12345,"total":12345,"files_processed":12303,"files_added":12000,"files_modified":303,"files_deleted":0,"files_resumed":42,"chunks_added":…,"elapsed_seconds":1234.5}
+{"event":"done","processed":12345,"total":12345,"files_processed":12303,"files_added":12000,"files_modified":303,"files_deleted":0,"files_resumed":42,"chunks_added":…,"files_failed":1,"partial":true,"elapsed_seconds":1234.5}
 ```
 
-- `start` precedes the first batch; one `batch` per committed batch (`processed` includes resumed files); `done` is the last event.
+- `start` precedes the first batch; one `batch` per committed batch (`processed` includes resumed files); one `file_failed` per skipped file (see [Skipped files](#skipped-files)), as soon as it is known; `done` is the last event and carries `files_failed` and `partial`.
 - `heartbeat` is sent only after `--progress-heartbeat-seconds` (default 5) without another event, from a dedicated thread, so a slow embedding call or store commit still produces a signal. A growing `processed` means slow; an unchanged one across heartbeats means stuck on the current batch.
 - Dry runs and up-to-date runs emit `start` (`sync_token: null`) and `done` only.
 - With `--progress jsonl`, the text summary moves to stderr and `--format json` prints the final result as one compact last line on stdout. Without the flags, output is unchanged.
