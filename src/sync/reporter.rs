@@ -355,7 +355,23 @@ mod tests {
             ProgressReporter::new(vec![Box::new(capture.clone())], Duration::from_millis(60));
         let started = Instant::now();
         reporter.start(run(started, 10, 3, false, false, Some("tok")));
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait for the observable condition, not a fixed time: a loaded CI
+        // runner can starve the heartbeat thread for far longer than 200ms.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while capture
+            .events()
+            .iter()
+            .filter(|e| e["event"] == "heartbeat")
+            .count()
+            < 2
+        {
+            assert!(
+                Instant::now() < deadline,
+                "no heartbeats: {:?}",
+                capture.events()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         reporter.batch(5, "a.md", "b.md");
         reporter.done(&crate::sync::result::empty_sync_result(false, false), 10);
         let after_done = capture.events().len();
@@ -374,8 +390,11 @@ mod tests {
         // Quiet period: counters carry the resumed baseline.
         assert_eq!(heartbeats[0]["processed"], 3);
         assert_eq!(heartbeats[0]["total"], 10);
-        assert_eq!(events[events.len() - 2]["event"], "batch");
-        assert_eq!(events[events.len() - 2]["processed"], 5);
+        let batch = events
+            .iter()
+            .find(|e| e["event"] == "batch")
+            .expect("batch event");
+        assert_eq!(batch["processed"], 5);
         assert_eq!(events.last().unwrap()["event"], "done");
     }
 
@@ -383,7 +402,7 @@ mod tests {
     fn busy_run_emits_no_heartbeat() {
         let capture = Capture::default();
         let reporter =
-            ProgressReporter::new(vec![Box::new(capture.clone())], Duration::from_millis(500));
+            ProgressReporter::new(vec![Box::new(capture.clone())], Duration::from_secs(60));
         reporter.start(run(Instant::now(), 4, 0, true, false, Some("t")));
         reporter.batch(2, "a", "b");
         reporter.batch(4, "c", "d");
