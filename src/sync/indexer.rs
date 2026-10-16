@@ -99,19 +99,21 @@ fn with_path(error: MinSyncError, path: &str) -> MinSyncError {
         }
         MinSyncError::Manifest(message) => MinSyncError::Manifest(format!("{path}: {message}")),
         MinSyncError::Config(message) => MinSyncError::Config(format!("{path}: {message}")),
+        MinSyncError::Timeout(message) => MinSyncError::Timeout(format!("{path}: {message}")),
         other => MinSyncError::Other(format!("{path}: {other}")),
     }
 }
 
 /// Record `failure` in `result` (skip mode) or abort with the path attached
-/// (fail mode).
+/// (fail mode). A timeout always aborts: it means the embedder is stuck, not
+/// that this file is bad, and it has its own exit code.
 fn record_failure(
     skip: bool,
     path: &str,
     failure: StageError,
     result: &mut SyncResult,
 ) -> Result<()> {
-    if !skip {
+    if !skip || matches!(failure.error, MinSyncError::Timeout(_)) {
         return Err(with_path(failure.error, path));
     }
     tracing::warn!(
