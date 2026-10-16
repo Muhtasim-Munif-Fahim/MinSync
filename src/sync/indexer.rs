@@ -105,7 +105,8 @@ fn with_path(error: MinSyncError, path: &str) -> MinSyncError {
 }
 
 /// Record `failure` in `result` (skip mode) or abort with the path attached
-/// (fail mode).
+/// (fail mode). A timeout always aborts: it means the embedder is stuck, not
+/// that this file is bad, and it has its own exit code.
 fn record_failure(
     skip: bool,
     path: &str,

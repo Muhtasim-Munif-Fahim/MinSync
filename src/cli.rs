@@ -22,6 +22,13 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Machine-readable progress stream format for `sync --progress`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProgressFormat {
+    /// One JSON object per line.
+    Jsonl,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum QueryMode {
     Vector,
@@ -62,6 +69,22 @@ pub enum Commands {
         wait: bool,
         #[arg(long)]
         batch_size: Option<usize>,
+        /// Stream progress events to stdout while syncing (human logs stay
+        /// on stderr). With `--format json` the final result becomes the
+        /// last stdout line, compact.
+        #[arg(long, value_enum)]
+        progress: Option<ProgressFormat>,
+        /// Also write the progress stream (JSONL) to this file, leaving
+        /// stdout for the final result.
+        #[arg(long, value_name = "PATH")]
+        progress_file: Option<std::path::PathBuf>,
+        /// Longest gap between progress events before a heartbeat is sent.
+        #[arg(
+            long,
+            default_value_t = crate::sync::DEFAULT_HEARTBEAT_SECONDS,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        progress_heartbeat_seconds: u64,
     },
     /// Search indexed content
     Query {

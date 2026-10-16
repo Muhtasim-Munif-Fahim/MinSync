@@ -4,6 +4,7 @@
 
 mod indexer;
 mod progress;
+mod reporter;
 mod result;
 
 use crate::chunker::Chunker;
@@ -20,12 +21,18 @@ use result::{change_path, empty_sync_result};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use reporter::RunStart;
+pub use reporter::{ProgressReporter, DEFAULT_HEARTBEAT_SECONDS};
 
 pub struct MinSync {
     root: PathBuf,
     minsync_dir: PathBuf,
     /// Overrides `[sync] checkpoint_every_files` (0 disables checkpoints).
     checkpoint_every: Option<usize>,
+    /// Machine-readable progress stream (`--progress jsonl`); `None` = off.
+    progress: Option<Arc<ProgressReporter>>,
 }
 
 impl MinSync {
@@ -35,6 +42,7 @@ impl MinSync {
             root,
             minsync_dir,
             checkpoint_every: None,
+            progress: None,
         }
     }
 
@@ -42,6 +50,13 @@ impl MinSync {
     /// `[sync] checkpoint_every_files`. `0` disables checkpoints.
     pub fn with_checkpoint_every(mut self, files: usize) -> Self {
         self.checkpoint_every = Some(files);
+        self
+    }
+
+    /// Stream machine-readable progress events (`start`, `batch`,
+    /// `heartbeat`, `done`) to `reporter` while syncing.
+    pub fn with_progress(mut self, reporter: Arc<ProgressReporter>) -> Self {
+        self.progress = Some(reporter);
         self
     }
 
@@ -217,6 +232,24 @@ impl MinSync {
         full: bool,
         dry_run: bool,
     ) -> Result<SyncResult> {
+        let outcome = self.sync_run(chunker, embedder, store, full, dry_run).await;
+        if outcome.is_err() {
+            // No `done` for a failed run; just stop the heartbeat.
+            if let Some(progress) = &self.progress {
+                progress.abort();
+            }
+        }
+        outcome
+    }
+
+    async fn sync_run(
+        &self,
+        chunker: &dyn Chunker,
+        embedder: &dyn Embedder,
+        store: &mut dyn VectorStore,
+        full: bool,
+        dry_run: bool,
+    ) -> Result<SyncResult> {
         let config_path = self.minsync_dir.join("config.toml");
         if !config_path.exists() {
             return Err(MinSyncError::NotInitialized);
@@ -319,6 +352,19 @@ impl MinSync {
         };
 
         if changes.is_empty() && !full {
+            if let Some(progress) = &self.progress {
+                progress.start(RunStart {
+                    started: start,
+                    total: 0,
+                    resumed: 0,
+                    full,
+                    dry_run,
+                    sync_token: None,
+                });
+                for failure in &scan_failures {
+                    progress.file_failed(failure);
+                }
+            }
             let mut result = empty_sync_result(dry_run, true);
             result.partial = !scan_failures.is_empty();
             result.files_failed = scan_failures;
@@ -326,10 +372,26 @@ impl MinSync {
             result.query_ready = cursor_path.exists();
             result.scan_errors = scan_errors;
             result.elapsed_seconds = start.elapsed().as_secs_f64();
+            if let Some(progress) = &self.progress {
+                progress.done(&result, 0);
+            }
             return Ok(result);
         }
 
         if dry_run {
+            if let Some(progress) = &self.progress {
+                progress.start(RunStart {
+                    started: start,
+                    total: changes.len(),
+                    resumed: 0,
+                    full,
+                    dry_run: true,
+                    sync_token: None,
+                });
+                for failure in &scan_failures {
+                    progress.file_failed(failure);
+                }
+            }
             let files_processed_paths = changes.iter().map(change_path).collect();
             let files_added = changes
                 .iter()
@@ -358,6 +420,9 @@ impl MinSync {
             result.files_checked = new_manifest.files.len();
             result.scan_errors = scan_errors;
             result.elapsed_seconds = start.elapsed().as_secs_f64();
+            if let Some(progress) = &self.progress {
+                progress.done(&result, changes.len());
+            }
             return Ok(result);
         }
 
@@ -462,6 +527,20 @@ impl MinSync {
             ));
         }
 
+        if let Some(progress) = &self.progress {
+            progress.start(RunStart {
+                started: start,
+                total: changes.len(),
+                resumed: result.files_resumed,
+                full,
+                dry_run: false,
+                sync_token: Some(&sync_token),
+            });
+            for failure in &result.files_failed {
+                progress.file_failed(failure);
+            }
+        }
+
         let mut processed_this_run = 0usize;
         let mut since_checkpoint = 0usize;
         let mut cursor_at = 0usize;
@@ -494,6 +573,11 @@ impl MinSync {
             };
             let failed_before = result.files_failed.len();
             index_batch(&self.root, &items, context, &mut result).await?;
+            if let Some(progress) = &self.progress {
+                for failure in &result.files_failed[failed_before..] {
+                    progress.file_failed(failure);
+                }
+            }
 
             // Logged only after the store commits returned: a logged path is
             // always safe to skip on resume. One fsync for the whole batch.
@@ -511,6 +595,15 @@ impl MinSync {
 
             processed_this_run += take;
             since_checkpoint += take;
+            if let Some(progress) = &self.progress {
+                if let (Some(first), Some(last)) = (group.first(), group.last()) {
+                    progress.batch(
+                        processed_this_run + result.files_resumed,
+                        &first.0.path,
+                        &last.0.path,
+                    );
+                }
+            }
             if checkpoint_every > 0 && since_checkpoint >= checkpoint_every {
                 since_checkpoint = 0;
                 store.checkpoint()?;
@@ -568,6 +661,9 @@ impl MinSync {
         Transaction::remove(&txn_path)?;
 
         result.elapsed_seconds = start.elapsed().as_secs_f64();
+        if let Some(progress) = &self.progress {
+            progress.done(&result, changes.len());
+        }
         Ok(result)
     }
 }
