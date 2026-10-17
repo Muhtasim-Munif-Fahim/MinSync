@@ -11,7 +11,7 @@ use crate::chunker::Chunker;
 use crate::config::{Config, OnFileError};
 use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
-use crate::manifest::{FileChange, Manifest};
+use crate::manifest::{FileChange, Manifest, ScanErrorKind};
 use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::{FileFailure, FileStage, SyncResult};
 use crate::vectorstore::{Filter, VectorStore};
@@ -102,9 +102,14 @@ impl MinSync {
         config.save(&self.minsync_dir.join("config.toml"))?;
         // Baseline only (the first sync is always full): a file that cannot
         // be read here is skipped and reported by that sync, not fatal.
-        Manifest::scan_with_baseline_stats(&self.root, &source_id, None)?
-            .0
-            .save(&self.minsync_dir.join("manifest.json"))?;
+        Manifest::scan_with_baseline_stats_and_max_file_bytes(
+            &self.root,
+            &source_id,
+            None,
+            config.sync.max_file_bytes,
+        )?
+        .0
+        .save(&self.minsync_dir.join("manifest.json"))?;
         if let Some(staging) = reset_staging {
             std::fs::remove_dir_all(staging)?;
         }
@@ -262,17 +267,33 @@ impl MinSync {
         let manifest_path = self.minsync_dir.join("manifest.json");
         let progress_path = self.minsync_dir.join(PROGRESS_FILE);
 
-        // A cursor-less workspace has never completed an initial sync: its
-        // baseline manifest (written by `init`) cannot drive a meaningful
-        // incremental diff, so upgrade to a full sync. This also guarantees
-        // the `already_up_to_date` early return below is unreachable while
-        // no cursor exists.
-        let initial_sync = !cursor_path.exists();
-        let stored_lexical_language = if cursor_path.exists() {
-            Cursor::load(&cursor_path)?.lexical_language
+        let stored_manifest = if manifest_path.exists() {
+            Some(Manifest::load(&manifest_path)?)
         } else {
-            config.lexical.language.clone()
+            None
         };
+        let stored_cursor = if cursor_path.exists() {
+            Some(Cursor::load(&cursor_path)?)
+        } else {
+            None
+        };
+        // A baseline manifest from `init` is not evidence that the index was
+        // populated. Trust the pair only when the cursor describes the exact
+        // manifest on disk; a crash between writing either file forces a safe
+        // full sync on the next run.
+        let has_completed_sync = matches!(
+            (&stored_cursor, &stored_manifest),
+            (Some(cursor), Some(manifest))
+                if cursor.source_id == config.source_id
+                    && manifest.source_id == config.source_id
+                    && cursor.manifest_hash == manifest.manifest_hash()
+        );
+        let initial_sync = !has_completed_sync;
+        let stored_lexical_language = stored_cursor
+            .as_ref()
+            .filter(|_| has_completed_sync)
+            .map(|cursor| cursor.lexical_language.clone())
+            .unwrap_or_else(|| config.lexical.language.clone());
         let lexical_rebuild = stored_lexical_language != config.lexical.language;
         let full = full || initial_sync || lexical_rebuild;
 
@@ -282,11 +303,6 @@ impl MinSync {
             Transaction::remove(&txn_path)?;
         }
 
-        let stored_manifest = if manifest_path.exists() {
-            Some(Manifest::load(&manifest_path)?)
-        } else {
-            None
-        };
         let old_manifest = if full {
             Manifest::new(&config.source_id)
         } else {
@@ -299,12 +315,14 @@ impl MinSync {
         let skip_failures = config.sync.on_file_error == OnFileError::Skip;
         // Entries the scan could not inspect are carried over from the stored
         // manifest: unknown, never deleted (issue #79).
-        let (new_manifest, scan_stats, unknown_paths) = Manifest::scan_keeping_unknown(
-            &self.root,
-            &config.source_id,
-            scan_baseline,
-            stored_manifest.as_ref(),
-        )?;
+        let (new_manifest, scan_stats, unknown_paths) =
+            Manifest::scan_keeping_unknown_with_max_file_bytes(
+                &self.root,
+                &config.source_id,
+                scan_baseline,
+                stored_manifest.as_ref(),
+                config.sync.max_file_bytes,
+            )?;
         let scan_errors = scan_stats.errors;
         if !skip_failures {
             // `on_file_error = "fail"`: abort on the first unreadable entry,
@@ -323,7 +341,11 @@ impl MinSync {
                 .iter()
                 .map(|error| FileFailure {
                     path: error.path.clone(),
-                    stage: FileStage::Read,
+                    stage: if error.kind == ScanErrorKind::SizeGuard {
+                        FileStage::SizeGuard
+                    } else {
+                        FileStage::Read
+                    },
                     error: error.error.clone(),
                 })
                 .collect()
@@ -635,8 +657,16 @@ impl MinSync {
         // manifest keeps its previous entry (or none, if it was never
         // indexed) instead of recording it as done.
         let mut saved_manifest = new_manifest.clone();
+        // Only a matching cursor/manifest pair proves that stored entries
+        // correspond to indexed chunks. In particular, `init`'s baseline and
+        // a manifest left behind by an interrupted commit are not trusted.
+        let prior_indexed_manifest = if has_completed_sync {
+            stored_manifest.as_ref()
+        } else {
+            None
+        };
         for failure in &result.files_failed {
-            match old_manifest.files.get(&failure.path) {
+            match prior_indexed_manifest.and_then(|manifest| manifest.files.get(&failure.path)) {
                 Some(entry) => {
                     saved_manifest
                         .files
@@ -648,6 +678,7 @@ impl MinSync {
             }
         }
         result.partial = !result.files_failed.is_empty();
+        saved_manifest.save(&manifest_path)?;
         Cursor {
             source_id: config.source_id.clone(),
             last_synced_at: chrono::Utc::now().to_rfc3339(),
@@ -655,16 +686,15 @@ impl MinSync {
             chunk_schema_id: chunker.schema_id().to_string(),
             embedder_id: embedder.id().to_string(),
             collection_path: config.collection.path.clone(),
-            // Rows spared above still carry the previous tokenization; keep
-            // the old language so the next sync redoes the rebuild for them.
-            lexical_language: if lexical_rebuild && !unknown_paths.is_empty() {
+            // Repeat a partial lexical rebuild: a failed file may have lost
+            // its old rows during the pre-sweep before indexing failed.
+            lexical_language: if lexical_rebuild && !result.files_failed.is_empty() {
                 stored_lexical_language.clone()
             } else {
                 config.lexical.language.clone()
             },
         }
         .save(&cursor_path)?;
-        saved_manifest.save(&manifest_path)?;
         ProgressLog::remove(&progress_path)?;
         Transaction::remove(&txn_path)?;
 
@@ -1745,6 +1775,51 @@ mod tests {
             .await
             .expect("sync");
         (store, result)
+    }
+
+    #[tokio::test]
+    async fn test_manifest_cursor_mismatch_forces_rebuild_after_interrupted_state_commit() {
+        let (dir, sync, chunker, _embedder, _store) = fixture();
+        write_numbered_files(&dir, 6);
+        init_sync(&sync);
+
+        // Model a crash after the old code saved a partial cursor but before
+        // it replaced init's full baseline manifest.
+        let manifest_path = sync.minsync_dir.join("manifest.json");
+        let manifest = Manifest::load(&manifest_path).expect("load init manifest");
+        let mut partial_manifest = manifest.clone();
+        assert!(partial_manifest.files.remove("f0.txt").is_some());
+        let config = Config::load(&sync.minsync_dir.join("config.toml")).expect("load config");
+        Cursor {
+            source_id: config.source_id.clone(),
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+            manifest_hash: partial_manifest.manifest_hash(),
+            chunk_schema_id: chunker.schema_id().to_string(),
+            embedder_id: "mock".to_string(),
+            collection_path: config.collection.path.clone(),
+            lexical_language: config.lexical.language.clone(),
+        }
+        .save(&sync.minsync_dir.join("cursor.json"))
+        .expect("write cursor from interrupted state commit");
+
+        let mut store = SpyStore::default();
+        let result = sync
+            .sync(&chunker, &MockEmbedder, &mut store, false, false, false)
+            .await
+            .expect("mismatched state triggers a complete rebuild");
+
+        assert!(result.initial_sync);
+        assert_eq!(result.files_processed, 6);
+        assert_eq!(store.all_paths().len(), 6);
+        assert_eq!(
+            Cursor::load(&sync.minsync_dir.join("cursor.json"))
+                .expect("load committed cursor")
+                .manifest_hash,
+            Manifest::load(&manifest_path)
+                .expect("load committed manifest")
+                .manifest_hash(),
+            "cursor and manifest must describe the same completed sync"
+        );
     }
 
     #[tokio::test]

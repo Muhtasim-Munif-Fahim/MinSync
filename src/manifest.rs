@@ -1,11 +1,12 @@
 use crate::error::{MinSyncError, Result};
+use crate::file_size::{size_guard_error, size_guard_message};
 use chrono::Utc;
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
@@ -35,6 +36,8 @@ pub enum ScanErrorKind {
     Transient,
     /// Needs user action (`EACCES`, `EPERM`, `EISDIR`, symlink loops, ...).
     Permanent,
+    /// The file exceeds the configured `[sync] max_file_bytes` limit.
+    SizeGuard,
 }
 
 /// A per-entry scan failure. The scan continues past it; the entry's state
@@ -100,13 +103,25 @@ impl Manifest {
         source_id: &str,
         baseline: Option<&Manifest>,
     ) -> Result<(Self, ScanStats)> {
-        Self::scan_with_fs(root, source_id, baseline, &RealFs)
+        Self::scan_with_baseline_stats_and_max_file_bytes(root, source_id, baseline, 0)
+    }
+
+    /// Scan while skipping files larger than `max_file_bytes`. A value of
+    /// zero keeps the unbounded behavior used by callers without sync config.
+    pub fn scan_with_baseline_stats_and_max_file_bytes(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+        max_file_bytes: u64,
+    ) -> Result<(Self, ScanStats)> {
+        Self::scan_with_fs(root, source_id, baseline, max_file_bytes, &RealFs)
     }
 
     fn scan_with_fs(
         root: &Path,
         source_id: &str,
         baseline: Option<&Manifest>,
+        max_file_bytes: u64,
         io: &dyn ScanFs,
     ) -> Result<(Self, ScanStats)> {
         let mut manifest = Self::new(source_id);
@@ -146,6 +161,10 @@ impl Manifest {
                     continue;
                 }
             };
+            if let Some(error) = size_guard_error(metadata.len(), max_file_bytes) {
+                record_error(&mut stats, manifest_path, ScanErrorKind::SizeGuard, error);
+                continue;
+            }
             let mtime_ns = match metadata
                 .modified()
                 .map_err(|error| error.to_string())
@@ -162,18 +181,29 @@ impl Manifest {
                 }
             };
             let fingerprint = metadata_fingerprint(&metadata, mtime_ns);
+            let mut file_size = metadata.len();
             let content_hash = match baseline
                 .and_then(|manifest| manifest.files.get(&manifest_path))
                 .filter(|entry| fingerprint.is_some() && entry.fingerprint == fingerprint)
             {
                 Some(entry) => entry.content_hash.clone(),
-                None => match io.hash_file(path) {
-                    Ok(hash) => {
+                None => match io.hash_file(path, max_file_bytes) {
+                    Ok((hash, bytes_hashed)) => {
                         stats.files_rehashed += 1;
-                        stats.bytes_hashed += metadata.len();
+                        stats.bytes_hashed += bytes_hashed;
+                        file_size = bytes_hashed;
                         hash
                     }
-                    Err(error) => {
+                    Err(HashFileError::TooLarge { size, limit }) => {
+                        record_error(
+                            &mut stats,
+                            manifest_path,
+                            ScanErrorKind::SizeGuard,
+                            size_guard_message(size, limit),
+                        );
+                        continue;
+                    }
+                    Err(HashFileError::Io(error)) => {
                         record_io_error(&mut stats, manifest_path, &error);
                         continue;
                     }
@@ -183,7 +213,7 @@ impl Manifest {
             manifest.files.insert(
                 manifest_path,
                 ManifestFileEntry {
-                    size: metadata.len(),
+                    size: file_size,
                     mtime_ns,
                     content_hash,
                     fingerprint,
@@ -208,7 +238,24 @@ impl Manifest {
         baseline: Option<&Manifest>,
         carry_from: Option<&Manifest>,
     ) -> Result<(Self, ScanStats, Vec<String>)> {
-        let (mut manifest, stats) = Self::scan_with_baseline_stats(root, source_id, baseline)?;
+        Self::scan_keeping_unknown_with_max_file_bytes(root, source_id, baseline, carry_from, 0)
+    }
+
+    /// Scan with a size cap, preserving previous entries that were too large
+    /// to inspect so their existing index rows cannot be swept as deletions.
+    pub fn scan_keeping_unknown_with_max_file_bytes(
+        root: &Path,
+        source_id: &str,
+        baseline: Option<&Manifest>,
+        carry_from: Option<&Manifest>,
+        max_file_bytes: u64,
+    ) -> Result<(Self, ScanStats, Vec<String>)> {
+        let (mut manifest, stats) = Self::scan_with_baseline_stats_and_max_file_bytes(
+            root,
+            source_id,
+            baseline,
+            max_file_bytes,
+        )?;
         let carried = match carry_from {
             Some(previous) => manifest.carry_unknown(previous, &stats.errors),
             None => Vec::new(),
@@ -322,7 +369,45 @@ fn prefixed_sha256(content: &[u8]) -> String {
 
 trait ScanFs {
     fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata>;
-    fn hash_file(&self, path: &Path) -> std::io::Result<String>;
+    fn hash_file(
+        &self,
+        path: &Path,
+        max_file_bytes: u64,
+    ) -> std::result::Result<(String, u64), HashFileError>;
+}
+
+#[derive(Debug)]
+enum HashFileError {
+    Io(io::Error),
+    TooLarge { size: u64, limit: u64 },
+}
+
+#[derive(Debug)]
+enum HashReaderError {
+    Io(io::Error),
+    TooLarge { bytes_hashed: u64 },
+}
+
+fn hash_reader<R: Read>(
+    reader: R,
+    limit: u64,
+) -> std::result::Result<(String, u64), HashReaderError> {
+    let mut hasher = Sha256::new();
+    let mut reader = reader;
+    let bytes_hashed = if limit == 0 {
+        io::copy(&mut reader, &mut hasher).map_err(HashReaderError::Io)?
+    } else {
+        let mut bounded = reader.take(limit.saturating_add(1));
+        let bytes_hashed = io::copy(&mut bounded, &mut hasher).map_err(HashReaderError::Io)?;
+        if bytes_hashed > limit {
+            return Err(HashReaderError::TooLarge { bytes_hashed });
+        }
+        bytes_hashed
+    };
+    Ok((
+        format!("sha256:{}", hex::encode(hasher.finalize())),
+        bytes_hashed,
+    ))
 }
 
 struct RealFs;
@@ -332,11 +417,33 @@ impl ScanFs for RealFs {
         fs::metadata(path)
     }
 
-    fn hash_file(&self, path: &Path) -> std::io::Result<String> {
-        let mut file = fs::File::open(path)?;
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher)?;
-        Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+    fn hash_file(
+        &self,
+        path: &Path,
+        max_file_bytes: u64,
+    ) -> std::result::Result<(String, u64), HashFileError> {
+        let file = fs::File::open(path).map_err(HashFileError::Io)?;
+        let initial_size = file.metadata().map_err(HashFileError::Io)?.len();
+        if size_guard_error(initial_size, max_file_bytes).is_some() {
+            return Err(HashFileError::TooLarge {
+                size: initial_size,
+                limit: max_file_bytes,
+            });
+        }
+        match hash_reader(file, max_file_bytes) {
+            Ok(result) => Ok(result),
+            Err(HashReaderError::Io(error)) => Err(HashFileError::Io(error)),
+            Err(HashReaderError::TooLarge { bytes_hashed }) => {
+                let size = fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(bytes_hashed)
+                    .max(bytes_hashed);
+                Err(HashFileError::TooLarge {
+                    size,
+                    limit: max_file_bytes,
+                })
+            }
+        }
     }
 }
 
@@ -452,7 +559,45 @@ fn metadata_fingerprint(_metadata: &fs::Metadata, _mtime_ns: u128) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_size::size_guard_message;
     use std::fs;
+
+    struct NoHashFs;
+
+    impl ScanFs for NoHashFs {
+        fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+            fs::metadata(path)
+        }
+
+        fn hash_file(
+            &self,
+            _path: &Path,
+            _max_file_bytes: u64,
+        ) -> std::result::Result<(String, u64), HashFileError> {
+            panic!("oversized file must not be hashed")
+        }
+    }
+
+    struct GrowsAfterScanMetadata;
+
+    impl ScanFs for GrowsAfterScanMetadata {
+        fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+            fs::metadata(path)
+        }
+
+        fn hash_file(
+            &self,
+            path: &Path,
+            max_file_bytes: u64,
+        ) -> std::result::Result<(String, u64), HashFileError> {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(HashFileError::Io)?;
+            file.write_all(b"x").map_err(HashFileError::Io)?;
+            RealFs.hash_file(path, max_file_bytes)
+        }
+    }
 
     fn entry(hash: &str) -> ManifestFileEntry {
         ManifestFileEntry {
@@ -668,6 +813,76 @@ mod tests {
     }
 
     #[test]
+    fn scan_skips_oversized_files_before_hashing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let contents = "larger than the cap";
+        fs::write(dir.path().join("large.txt"), contents).expect("write file");
+
+        let (manifest, stats) = Manifest::scan_with_fs(dir.path(), "source-1", None, 4, &NoHashFs)
+            .expect("scan records the size guard");
+
+        assert!(!manifest.files.contains_key("large.txt"));
+        assert_eq!(stats.files_rehashed, 0);
+        assert_eq!(stats.bytes_hashed, 0);
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(stats.errors[0].path, "large.txt");
+        assert_eq!(stats.errors[0].kind, ScanErrorKind::SizeGuard);
+        assert_eq!(
+            stats.errors[0].error,
+            size_guard_message(contents.len() as u64, 4)
+        );
+    }
+
+    #[test]
+    fn capped_hash_reads_at_most_one_byte_past_the_limit() {
+        let mut reader = std::io::Cursor::new(b"more than four bytes");
+
+        let error = hash_reader(&mut reader, 4).expect_err("growing file exceeds cap");
+
+        assert!(matches!(
+            error,
+            HashReaderError::TooLarge { bytes_hashed: 5 }
+        ));
+        assert_eq!(reader.position(), 5);
+    }
+
+    #[test]
+    fn scan_reports_size_guard_if_file_grows_after_metadata_check() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("growing.txt"), "1234").expect("write file");
+
+        let (manifest, stats) =
+            Manifest::scan_with_fs(dir.path(), "source-1", None, 4, &GrowsAfterScanMetadata)
+                .expect("scan records growth as a size guard");
+
+        assert!(!manifest.files.contains_key("growing.txt"));
+        assert_eq!(stats.bytes_hashed, 0);
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(stats.errors[0].kind, ScanErrorKind::SizeGuard);
+        assert_eq!(stats.errors[0].error, size_guard_message(5, 4));
+    }
+
+    #[test]
+    fn capped_scan_carries_an_old_manifest_entry_as_unknown() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        fs::write(dir.path().join("large.txt"), "large content").expect("write file");
+        let previous = Manifest::scan(dir.path(), "source-1").expect("create previous manifest");
+
+        let (manifest, stats, carried) = Manifest::scan_keeping_unknown_with_max_file_bytes(
+            dir.path(),
+            "source-1",
+            None,
+            Some(&previous),
+            4,
+        )
+        .expect("scan preserves the old entry");
+
+        assert_eq!(manifest.files["large.txt"], previous.files["large.txt"]);
+        assert_eq!(carried, vec!["large.txt"]);
+        assert_eq!(stats.errors[0].kind, ScanErrorKind::SizeGuard);
+    }
+
+    #[test]
     fn test_manifest_scan_with_minsyncignore() {
         let dir = tempfile::tempdir().expect("create tempdir");
         fs::write(
@@ -829,17 +1044,22 @@ mod tests {
             }
         }
 
-        fn hash_file(&self, path: &Path) -> std::io::Result<String> {
+        fn hash_file(
+            &self,
+            path: &Path,
+            max_file_bytes: u64,
+        ) -> std::result::Result<(String, u64), HashFileError> {
             match Self::lookup(&self.hash_errors, path) {
-                Some(error) => Err(error),
-                None => RealFs.hash_file(path),
+                Some(error) => Err(HashFileError::Io(error)),
+                None => RealFs.hash_file(path, max_file_bytes),
             }
         }
     }
 
     #[cfg(unix)]
     fn scan_faulty(dir: &Path, faulty: &FaultyFs) -> (Manifest, ScanStats) {
-        Manifest::scan_with_fs(dir, "source-1", None, faulty).expect("scan survives entry errors")
+        Manifest::scan_with_fs(dir, "source-1", None, 0, faulty)
+            .expect("scan survives entry errors")
     }
 
     #[cfg(unix)]
