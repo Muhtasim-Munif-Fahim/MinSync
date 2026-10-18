@@ -342,6 +342,50 @@ passage_prefix = "passage: "
 dimension = 384
 ```
 
+### Embedding 서버
+
+`minsync serve`는 native embedder를 한 번만 로드해 loopback으로 제공합니다. 다른 도구와 반복되는 CLI 호출이 모델을 각자 로드하지 않고 하나를 공유합니다.
+
+```bash
+minsync serve                    # workspace config가 있으면 그 설정, 없으면 기본 모델
+minsync serve --port 8089 --idle-timeout 600
+```
+
+| Endpoint | 요청 | 응답 |
+|---|---|---|
+| `POST /embed` (TEI) | `{"inputs": [...], "truncate"?: bool}` | `[[f32, ...], ...]` |
+| `POST /v1/embeddings` (OpenAI) | `{"model", "input": [...], "encoding_format"?: "float" \| "base64"}` | `{"object": "list", "data": [{"index", "embedding"}], "model", "usage"}` |
+| `GET /health` | | model id, dimension, dtype, device, pid, port |
+
+- 같은 텍스트·device·dtype이면 in-process `native:`와 같은 vector를 돌려줍니다. 요청은 `sync`와 같은 batch planner, padded-token 상한, pass별 deadline을 거칩니다.
+- Prefix는 호출자가 붙입니다. 두 endpoint 모두 `"input_type": "query" | "passage"`를 받으면 설정된 `query_prefix` / `passage_prefix`를 붙입니다.
+- 모델 context를 넘는 입력은 `truncate: true`(TEI)가 아니면 `413`입니다. `--max-inputs`(기본 512)개 초과 입력이나 `--max-request-bytes`(기본 32 MiB) 초과 body도 `413`, 잘못된 JSON은 `400`/`422`입니다. forward pass가 deadline을 넘기면 `503`을 돌려주고 서버는 exit code 7로 종료합니다(멈춘 thread가 모델을 잡고 있기 때문).
+- 인증이 없으므로 `127.0.0.1`(또는 `::1`)에만 bind하고 다른 `--host`는 거부합니다. `--port 0`(기본)은 빈 port를 고릅니다.
+- `pid`, `host`, `port` 파일은 `~/.cache/minsync/serve/<model instance>/`에 있습니다(`--state-dir`로 변경). 같은 model·device·dtype·attention·`max_length`로 두 번째 `minsync serve`를 실행하면 모델을 로드하지 않고 실행 중인 서버를 출력(`--format json`이면 `"event": "adopted"`)한 뒤 종료합니다.
+- `--idle-timeout`초(기본 300, `0`은 비활성) 동안 embedding 요청이 없으면 종료하고 모델을 해제합니다. `SIGTERM`/Ctrl-C도 정상 종료하며, 두 경우 모두 discovery 파일을 지웁니다.
+
+TEI 또는 OpenAI 호환 client를 이 서버로 지정하면 됩니다. 예: 다른 workspace
+
+```toml
+[embedder]
+id = "tei:Qwen/Qwen3-Embedding-0.6B"
+base_url = "http://127.0.0.1:8089"
+
+[vectorstore.options]
+dimension = 1024
+```
+
+OpenAI 호환 client는 `/v1` base URL을 씁니다. 예: discrawl (API key env가 필요하지만 서버는 무시합니다)
+
+```toml
+[search.embeddings]
+enabled = true
+provider = "openai_compatible"
+model = "Qwen/Qwen3-Embedding-0.6B"
+base_url = "http://127.0.0.1:8089/v1"
+api_key_env = "OPENAI_API_KEY"   # 비어 있지 않은 아무 값
+```
+
 ## Ignoring Files
 
 `.minsyncignore`는 `.gitignore` syntax를 사용합니다.

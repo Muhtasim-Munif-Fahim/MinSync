@@ -415,6 +415,50 @@ passage_prefix = "passage: "
 dimension = 384
 ```
 
+### Embedding server
+
+`minsync serve` loads the native embedder once and serves it on loopback, so other tools (and repeated CLI calls) share one model instead of each loading its own copy:
+
+```bash
+minsync serve                    # workspace config if present, else the default model
+minsync serve --port 8089 --idle-timeout 600
+```
+
+| Endpoint | Request | Response |
+|---|---|---|
+| `POST /embed` (TEI) | `{"inputs": [...], "truncate"?: bool}` | `[[f32, ...], ...]` |
+| `POST /v1/embeddings` (OpenAI) | `{"model", "input": [...], "encoding_format"?: "float" \| "base64"}` | `{"object": "list", "data": [{"index", "embedding"}], "model", "usage"}` |
+| `GET /health` | | model id, dimension, dtype, device, pid, port |
+
+- Vectors are the same as in-process `native:` for the same text, device and dtype: requests run through the same batch planner, padded-token cap and per-pass deadline as `sync`.
+- Prefixes are the caller's job. Both endpoints also accept `"input_type": "query" | "passage"`, which applies the configured `query_prefix` / `passage_prefix`.
+- Inputs over the model context return `413` unless `truncate: true` (TEI). More than `--max-inputs` inputs (default 512) or a body over `--max-request-bytes` (default 32 MiB) also return `413`; malformed JSON returns `400`/`422`. A forward pass that exceeds its deadline returns `503` and the server exits with code 7, since the stuck thread holds the model.
+- It binds `127.0.0.1` (or `::1`) only; other `--host` values are refused because there is no authentication. `--port 0` (default) picks a free port.
+- `pid`, `host` and `port` files live in `~/.cache/minsync/serve/<model instance>/` (override with `--state-dir`). A second `minsync serve` for the same model, device, dtype, attention and `max_length` finds the running server, prints it (`"event": "adopted"` with `--format json`) and exits without loading the model.
+- After `--idle-timeout` seconds (default 300; `0` disables) without an embedding request the server exits and frees the model. `SIGTERM`/Ctrl-C stop it cleanly; both remove the discovery files.
+
+Point any TEI or OpenAI-compatible client at it, e.g. a second workspace:
+
+```toml
+[embedder]
+id = "tei:Qwen/Qwen3-Embedding-0.6B"
+base_url = "http://127.0.0.1:8089"
+
+[vectorstore.options]
+dimension = 1024
+```
+
+OpenAI-compatible clients take the `/v1` base URL. For example discrawl (it requires some API key env; the server ignores it):
+
+```toml
+[search.embeddings]
+enabled = true
+provider = "openai_compatible"
+model = "Qwen/Qwen3-Embedding-0.6B"
+base_url = "http://127.0.0.1:8089/v1"
+api_key_env = "OPENAI_API_KEY"   # any non-empty value
+```
+
 ## Ignoring Files
 
 `.minsyncignore` uses `.gitignore` syntax:

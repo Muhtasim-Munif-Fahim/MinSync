@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use tokio::sync::OnceCell;
 
-const DEFAULT_MAX_LENGTH: usize = 2048;
+pub(crate) const DEFAULT_MAX_LENGTH: usize = 2048;
 
 #[cfg(test)]
 #[test]
@@ -73,7 +73,13 @@ enum NativeDtype {
 #[derive(Clone)]
 struct LoadedModel {
     model: Arc<Mutex<Qwen3Embedder>>,
+    /// Serializes forward passes ahead of the deadline; see [`embed_in_batches`].
+    gate: Arc<tokio::sync::Mutex<()>>,
     attention_heads: usize,
+    /// Output vector length (`hidden_size`).
+    dimension: usize,
+    /// `cpu`, `metal:N` or `cuda:N`.
+    device: String,
     dtype: DType,
     backend: AttentionBackend,
     /// Deadline for one forward pass on the device the model loaded onto.
@@ -239,10 +245,13 @@ impl NativeEmbedder {
                     );
                     Ok(LoadedModel {
                         attention_heads: model.config().num_attention_heads.max(1),
+                        dimension: model.config().hidden_size,
+                        device: device_label(&device),
                         dtype,
                         backend: model.backend(),
                         batch_timeout,
                         model: Arc::new(Mutex::new(model)),
+                        gate: Arc::new(tokio::sync::Mutex::new(())),
                     })
                 })
                 .await
@@ -252,6 +261,22 @@ impl NativeEmbedder {
             })
             .await
             .cloned()
+    }
+
+    /// Tokens per text as the model sees it before truncation.
+    async fn token_counts_of(&self, texts: &[String]) -> Result<Vec<usize>> {
+        let tokenizer = self.tokenizer().await?;
+        texts
+            .iter()
+            .map(|text| {
+                tokenizer
+                    .encode(text.as_str(), true)
+                    .map(|encoding| encoding.len())
+                    .map_err(|error| {
+                        MinSyncError::Embedding(format!("native tokenizer encode failed: {error}"))
+                    })
+            })
+            .collect()
     }
 
     async fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
@@ -269,6 +294,7 @@ impl NativeEmbedder {
         let backend = loaded.backend;
         let batch_timeout = loaded.batch_timeout;
         let model = loaded.model;
+        let gate = loaded.gate;
         let batches = plan_batches(
             &texts,
             self.batch_size,
@@ -280,6 +306,7 @@ impl NativeEmbedder {
         );
         embed_in_batches(
             self.deadline,
+            &gate,
             batch_timeout,
             texts,
             batches,
@@ -299,8 +326,13 @@ impl NativeEmbedder {
 /// Run `embed_batch` over each planned batch on the blocking pool, each
 /// forward pass under its own `batch_timeout` so a stuck kernel surfaces as
 /// [`MinSyncError::Timeout`] instead of hanging the caller.
+///
+/// `gate` admits one forward pass at a time. Callers queue on it *before*
+/// the deadline starts, so a pass only times out on its own runtime, not
+/// while another caller (e.g. a concurrent server request) holds the model.
 async fn embed_in_batches<F>(
     deadline: &BatchDeadline,
+    gate: &tokio::sync::Mutex<()>,
     batch_timeout: Duration,
     texts: Vec<String>,
     batches: Vec<std::ops::Range<usize>>,
@@ -316,6 +348,7 @@ where
         let batch_texts = Arc::clone(&texts);
         let embed_batch = Arc::clone(&embed_batch);
         let expected = range.len();
+        let _turn = gate.lock().await;
         let vectors = deadline
             .run("native embedding batch", batch_timeout, move || {
                 embed_batch(&batch_texts[range])
@@ -371,6 +404,34 @@ impl Embedder for NativeEmbedder {
             .into_iter()
             .next()
             .ok_or_else(|| MinSyncError::Embedding("empty response".to_string()))
+    }
+}
+
+/// `minsync serve` runs the same engine, batch planner and deadline as
+/// `sync`; only the prefixes move to the caller.
+#[async_trait]
+impl crate::serve::ServeEngine for NativeEmbedder {
+    async fn load(&self) -> Result<crate::serve::EngineInfo> {
+        self.deadline.ensure_healthy("native embedding")?;
+        let loaded = self.model().await?;
+        // The tokenizer guards the context per request; load it up front too.
+        self.tokenizer().await?;
+        Ok(crate::serve::EngineInfo {
+            model_id: self.model_id.clone(),
+            dimension: loaded.dimension,
+            dtype: loaded.dtype.as_str().to_string(),
+            device: loaded.device,
+            attention: format!("{:?}", loaded.backend).to_ascii_lowercase(),
+            max_length: self.max_length,
+        })
+    }
+
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
+        self.token_counts_of(texts).await
+    }
+
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.embed_texts(texts).await
     }
 }
 
@@ -601,18 +662,30 @@ fn apply_cache_dir(configured: Option<&std::path::Path>) {
 }
 
 fn default_model_cache_dir() -> PathBuf {
+    minsync_cache_root().join("models")
+}
+
+/// `~/.cache/minsync` (`%LOCALAPPDATA%\minsync` on Windows).
+pub(crate) fn minsync_cache_root() -> PathBuf {
     #[cfg(windows)]
     {
         let root = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(root).join("minsync").join("models")
+        PathBuf::from(root).join("minsync")
     }
     #[cfg(not(windows))]
     {
         let root = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(root)
-            .join(".cache")
-            .join("minsync")
-            .join("models")
+        PathBuf::from(root).join(".cache").join("minsync")
+    }
+}
+
+fn device_label(device: &Device) -> String {
+    // Metal's `gpu_id` is an IORegistry id, not an ordinal; candle always
+    // opens device 0, so the label carries no index.
+    match device.location() {
+        candle_core::DeviceLocation::Cpu => "cpu".to_string(),
+        candle_core::DeviceLocation::Metal { .. } => "metal".to_string(),
+        candle_core::DeviceLocation::Cuda { gpu_id } => format!("cuda:{gpu_id}"),
     }
 }
 
@@ -936,6 +1009,7 @@ mod deadline_tests {
 
         let outcome = embed_in_batches(
             &deadline,
+            &tokio::sync::Mutex::new(()),
             Duration::from_millis(100),
             texts,
             vec![0..2, 2..4],
@@ -962,6 +1036,7 @@ mod deadline_tests {
 
         let vectors = embed_in_batches(
             &deadline,
+            &tokio::sync::Mutex::new(()),
             Duration::from_secs(5),
             texts,
             vec![0..2, 2..5],
@@ -988,6 +1063,7 @@ mod deadline_tests {
 
         let outcome = embed_in_batches(
             &deadline,
+            &tokio::sync::Mutex::new(()),
             Duration::from_secs(5),
             vec!["a".into(), "b".into()],
             vec![0..2],
@@ -996,5 +1072,42 @@ mod deadline_tests {
         .await;
 
         assert!(matches!(outcome, Err(MinSyncError::Embedding(_))));
+    }
+
+    /// A server runs several requests at once against one model. Waiting
+    /// for another request's forward pass must not count against this
+    /// request's per-pass deadline, or a busy server would declare itself
+    /// wedged although every pass finished in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::single_range_in_vec_init)]
+    async fn waiting_for_another_callers_pass_does_not_count_against_the_deadline() {
+        let deadline = Arc::new(BatchDeadline::new());
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let model = Arc::new(Mutex::new(()));
+        let run = |name: &'static str| {
+            let deadline = Arc::clone(&deadline);
+            let gate = Arc::clone(&gate);
+            let model = Arc::clone(&model);
+            tokio::spawn(async move {
+                embed_in_batches(
+                    &deadline,
+                    &gate,
+                    Duration::from_millis(400),
+                    vec![name.to_string()],
+                    vec![0..1],
+                    move |chunk: &[String]| {
+                        let _model = model.lock().unwrap();
+                        std::thread::sleep(Duration::from_millis(250));
+                        Ok(chunk.iter().map(|_| vec![1.0]).collect())
+                    },
+                )
+                .await
+            })
+        };
+        let handles: Vec<_> = ["a", "b", "c"].into_iter().map(run).collect();
+        for handle in handles {
+            let outcome = handle.await.unwrap();
+            assert!(outcome.is_ok(), "{outcome:?}");
+        }
     }
 }

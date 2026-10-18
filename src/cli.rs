@@ -118,6 +118,37 @@ pub enum Commands {
         #[arg(long)]
         watch_on_sync_error: bool,
     },
+    /// Serve the configured native embedder over loopback HTTP (TEI
+    /// `POST /embed`, OpenAI `POST /v1/embeddings`, `GET /health`) so other
+    /// processes share one loaded model. Adopts a server already running
+    /// for the same model instead of loading a second copy.
+    Serve {
+        /// Loopback address to bind (127.0.0.1, ::1 or localhost); other
+        /// addresses are rejected because the server has no authentication.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port; 0 picks a free one (written to the `port` file).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Seconds without an embedding request before the server exits and
+        /// frees the model; 0 serves until stopped.
+        #[arg(long, default_value_t = crate::serve::DEFAULT_IDLE_TIMEOUT_SECONDS)]
+        idle_timeout: u64,
+        /// Most inputs accepted in one request (larger requests get 413).
+        #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_INPUTS)]
+        max_inputs: usize,
+        /// Largest request body in bytes (larger requests get 413).
+        #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_REQUEST_BYTES)]
+        max_request_bytes: usize,
+        /// Directory for the `pid`, `host`, `port` and `lock` files.
+        /// Defaults to ~/.cache/minsync/serve/<model instance>.
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<std::path::PathBuf>,
+        /// Native embedder id to serve. Defaults to the workspace's
+        /// `.minsync/config.toml` embedder, else the default model.
+        #[arg(long)]
+        embedder: Option<String>,
+    },
 }
 
 #[cfg(test)]
