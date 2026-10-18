@@ -153,7 +153,8 @@ pub struct EmbedderConfig {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     /// Native embedder only: deadline in seconds for a single forward pass
-    /// (one batch). Defaults to `timeout_seconds`.
+    /// (one batch). Defaults to `timeout_seconds`, but at least 900 on CPU,
+    /// where a pass is slow rather than stuck.
     #[serde(default)]
     pub per_batch_timeout_seconds: Option<u64>,
     #[serde(default)]
@@ -170,10 +171,17 @@ pub struct EmbedderConfig {
     /// Ignored by `openai:` / `tei:` providers.
     #[serde(default)]
     pub device: Option<String>,
-    /// Native embedder dtype: `f32`, `f16`, or `bf16`.
+    /// Native embedder dtype: `auto`, `f32`, `f16`, or `bf16`. `auto` (the
+    /// default) is `f16` on Metal and `f32` elsewhere.
     /// Ignored by `openai:` / `tei:` providers.
     #[serde(default)]
     pub dtype: Option<String>,
+    /// Native attention implementation: `auto` (default), `eager`, `tiled`, or
+    /// `fused`. `auto` uses the device's fused kernel (Metal SDPA, CPU flash
+    /// attention) and otherwise tiles the score matrix, which bounds memory.
+    /// `eager` is the reference implementation. Ignored by `openai:` / `tei:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
     /// Native tokenizer max length in tokens. Ignored by `openai:` / `tei:`.
     #[serde(default)]
     pub max_length: Option<usize>,
@@ -204,7 +212,7 @@ fn default_timeout_seconds() -> u64 {
     60
 }
 
-/// Default embedder: in-process Qwen3 via fastembed-rs, so a fresh index
+/// Default embedder: in-process Qwen3 (candle), so a fresh index
 /// works with no API key, TEI server, or Hugging Face gate.
 pub const DEFAULT_EMBEDDER_ID: &str = "native:Qwen/Qwen3-Embedding-0.6B";
 
@@ -307,6 +315,7 @@ impl Config {
                 truncate: false,
                 device: None,
                 dtype: None,
+                attention: None,
                 max_length: None,
                 max_batch_tokens: None,
                 model_cache_dir: None,
