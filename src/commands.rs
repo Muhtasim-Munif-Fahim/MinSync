@@ -42,6 +42,27 @@ pub async fn run(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<i32> {
         )
         .await;
     }
+    if let Commands::Serve {
+        host,
+        port,
+        idle_timeout,
+        max_inputs,
+        max_request_bytes,
+        state_dir,
+        embedder,
+    } = cli.command
+    {
+        let options = ServeArgs {
+            host,
+            port,
+            idle_timeout,
+            max_inputs,
+            max_request_bytes,
+            state_dir,
+            embedder,
+        };
+        return serve(&cli.format, &minsync_dir, options).await;
+    }
     run_other(cli, root, minsync_dir).await.map(|()| 0)
 }
 
@@ -53,7 +74,7 @@ async fn run_other(cli: Cli, root: PathBuf, minsync_dir: PathBuf) -> Result<()> 
             chunker,
             language,
         } => init(&cli.format, root, force, &embedder, &chunker, &language),
-        Commands::Sync { .. } => unreachable!("handled by run"),
+        Commands::Sync { .. } | Commands::Serve { .. } => unreachable!("handled by run"),
         Commands::Query { text, k, mode } => query(&cli.format, &minsync_dir, &text, k, mode).await,
         Commands::Status => status(&cli.format, &minsync_dir).await,
         Commands::Optimize => optimize(&cli.format, &minsync_dir),
@@ -530,6 +551,121 @@ async fn watch(
     )
     .await?;
     Ok(())
+}
+
+struct ServeArgs {
+    host: String,
+    port: u16,
+    idle_timeout: u64,
+    max_inputs: usize,
+    max_request_bytes: usize,
+    state_dir: Option<PathBuf>,
+    embedder: Option<String>,
+}
+
+/// Embedder settings `serve` runs with: the workspace config when present
+/// (its device/dtype/limits/prefixes), else defaults; `--embedder`
+/// overrides the id.
+fn serve_settings(
+    minsync_dir: &std::path::Path,
+    embedder: Option<String>,
+) -> Result<crate::config::EmbedderConfig> {
+    let config_path = minsync_dir.join("config.toml");
+    let mut settings = if config_path.exists() {
+        crate::config::Config::load(&config_path)?.embedder
+    } else {
+        crate::config::Config::default_for("serve").embedder
+    };
+    if let Some(id) = embedder {
+        settings.id = if id.contains(':') {
+            id
+        } else {
+            format!("native:{id}")
+        };
+    }
+    Ok(settings)
+}
+
+async fn serve(
+    format: &OutputFormat,
+    minsync_dir: &std::path::Path,
+    args: ServeArgs,
+) -> Result<i32> {
+    let host = crate::serve::parse_loopback_host(&args.host)?;
+    let settings = serve_settings(minsync_dir, args.embedder)?;
+    let instance = crate::serve::instance_key(&settings)?;
+    let engine = crate::embedder::native::NativeEmbedder::from_config(&settings)?;
+    let options = crate::serve::ServeOptions {
+        host,
+        port: args.port,
+        idle_timeout: (args.idle_timeout > 0)
+            .then(|| std::time::Duration::from_secs(args.idle_timeout)),
+        max_inputs: args.max_inputs.max(1),
+        max_request_bytes: args.max_request_bytes.max(1),
+        state_dir: args
+            .state_dir
+            .unwrap_or_else(|| crate::serve::default_state_dir(&instance)),
+        instance,
+        query_prefix: settings.query_prefix.clone(),
+        passage_prefix: settings.passage_prefix.clone(),
+    };
+    let state_dir = options.state_dir.clone();
+    let print = |event: &str, health: &crate::serve::Health| -> Result<()> {
+        match format {
+            OutputFormat::Json => {
+                let mut value = serde_json::to_value(health)?;
+                value["event"] = serde_json::Value::from(event);
+                value["state_dir"] = serde_json::Value::from(state_dir.display().to_string());
+                println!("{}", serde_json::to_string(&value)?);
+            }
+            OutputFormat::Text => println!(
+                "{event}: {} on {} ({} dims, {}, {}, pid {}); state {}",
+                health.model_id,
+                health.url,
+                health.dimension,
+                health.device,
+                health.dtype,
+                health.pid,
+                state_dir.display()
+            ),
+        }
+        std::io::stdout().flush()?;
+        Ok(())
+    };
+    let server = match crate::serve::start(std::sync::Arc::new(engine), options).await? {
+        crate::serve::Started::Adopted(health) => {
+            print("adopted", &health)?;
+            return Ok(0);
+        }
+        crate::serve::Started::Serving(server) => server,
+    };
+    print("serving", server.health())?;
+    let reason = server.run_until(shutdown_signal()).await?;
+    tracing::info!(reason = reason.as_str(), "minsync serve stopped");
+    Ok(reason.exit_code())
+}
+
+/// SIGTERM or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn require_initialized(minsync_dir: &std::path::Path) -> Result<()> {
