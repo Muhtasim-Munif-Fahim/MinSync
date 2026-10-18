@@ -364,6 +364,8 @@ minsync serve --port 8089 --idle-timeout 600
 - `pid`, `host`, `port` 파일은 `~/.cache/minsync/serve/<model instance>/`에 있습니다(`--state-dir`로 변경). 같은 model·device·dtype·attention·`max_length`로 두 번째 `minsync serve`를 실행하면 모델을 로드하지 않고 실행 중인 서버를 출력(`--format json`이면 `"event": "adopted"`)한 뒤 종료합니다.
 - `--idle-timeout`초(기본 300, `0`은 비활성) 동안 embedding 요청이 없으면 종료하고 모델을 해제합니다. `SIGTERM`/Ctrl-C도 정상 종료하며, 두 경우 모두 discovery 파일을 지웁니다.
 
+`native:` workspace는 실행 중인 서버를 자동으로 사용합니다. `sync`, `query`, `check`, `verify`, `watch`는 첫 embedding 호출 때 같은 model instance의 discovery 파일을 찾아 텍스트를 서버로 보냅니다(workspace prefix 적용, in-process 엔진처럼 `max_length`에서 truncate). 서버가 없거나 응답을 멈추면 이전처럼 in-process로 embedding합니다. M 시리즈 Mac에서 warm 서버는 `query`를 약 2.3 s / 2.4 GB에서 약 0.22 s / 59 MB로 줄입니다. `MINSYNC_SERVER=off`면 항상 in-process로 embedding합니다. 서버가 발견되려면 기본 `--state-dir`을 써야 합니다.
+
 TEI 또는 OpenAI 호환 client를 이 서버로 지정하면 됩니다. 예: 다른 workspace
 
 ```toml

@@ -505,7 +505,7 @@ fn batch_timeout(settings: &EmbedderConfig) -> Result<Duration> {
 /// pass is slow but does not hang: a 2-chunk pass of long inputs needs minutes
 /// on a mid-range desktop CPU, which the 60 s default meant for a stuck GPU
 /// kernel would abort as a timeout.
-const CPU_BATCH_TIMEOUT: Duration = Duration::from_secs(900);
+pub(crate) const CPU_BATCH_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// The deadline a loaded model runs under. An explicit
 /// `per_batch_timeout_seconds` always wins; otherwise CPU gets at least
