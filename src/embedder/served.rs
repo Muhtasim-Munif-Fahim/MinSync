@@ -152,12 +152,14 @@ async fn send(
         .send()
         .await
         .map_err(|error| {
-            if error.is_connect() {
-                RemoteError::Gone(error.to_string())
-            } else if error.is_timeout() {
+            if error.is_timeout() {
                 RemoteError::Failed(MinSyncError::Timeout(format!(
                     "minsync serve request timed out: {error}"
                 )))
+            } else if error.is_connect() || error.is_request() {
+                // No response at all: refused, or reset because the server
+                // exited (idle or SIGTERM) while the request was on the wire.
+                RemoteError::Gone(error.to_string())
             } else {
                 RemoteError::Failed(MinSyncError::Embedding(format!(
                     "minsync serve request failed: {error}"
@@ -457,6 +459,50 @@ mod tests {
         drop(server);
         assert_eq!(embedder.embed(&texts).await.unwrap(), vec![vec![-1.0, 1.0]]);
         assert_eq!(local.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The server dies after accepting the connection: the request fails
+    /// with a reset, not a refused connection, and must still fall back.
+    #[tokio::test]
+    async fn a_connection_reset_without_a_response_falls_back() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let health = serde_json::to_vec(&json!({
+            "status": "ok", "model_id": "Fake/Model", "dimension": 2, "dtype": "f32",
+            "device": "cpu", "attention": "eager", "max_length": 2048, "max_inputs": 512,
+            "instance": INSTANCE, "pid": 1, "host": addr.ip().to_string(),
+            "port": addr.port(), "url": format!("http://{addr}"), "version": "test",
+        }))
+        .unwrap();
+        // Answers `/health`; reads `/embed` and closes without a response.
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let health = health.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if buf[..n].starts_with(b"GET /health") {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            health.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&health).await;
+                    }
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("host"), "127.0.0.1\n").unwrap();
+        std::fs::write(dir.path().join("port"), format!("{}\n", addr.port())).unwrap();
+        let local = Local::default();
+        let embedder = served(&local, dir.path());
+        assert!(embedder.remote().await.is_some());
+        let texts = vec!["a".to_string()];
+        assert_eq!(embedder.embed(&texts).await.unwrap(), vec![vec![-1.0, 1.0]]);
+        assert_eq!(embedder.embed(&texts).await.unwrap(), vec![vec![-1.0, 1.0]]);
+        assert_eq!(local.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
