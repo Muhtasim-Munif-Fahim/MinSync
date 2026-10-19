@@ -209,3 +209,128 @@ async fn live_server_matches_in_process_native_embeddings() {
     #[cfg(not(unix))]
     child.kill().unwrap();
 }
+
+fn write_corpus(root: &Path) {
+    let docs = [
+        (
+            "rust.md",
+            "Rust guarantees memory safety without a garbage collector.",
+        ),
+        (
+            "bread.md",
+            "Sourdough bread rises slowly with a wild yeast starter.",
+        ),
+        (
+            "space.md",
+            "The James Webb telescope observes infrared light from early galaxies.",
+        ),
+        (
+            "korean.md",
+            "김치는 배추를 소금에 절여 양념과 함께 발효시킨 음식이다.",
+        ),
+    ];
+    for (name, text) in docs {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+}
+
+fn query_json(root: &Path, server: &str, text: &str) -> (Vec<(String, f64)>, String) {
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("minsync"))
+        .current_dir(root)
+        .env("MINSYNC_SERVER", server)
+        .env("HOME", std::env::var("HOME").unwrap())
+        .args(["--format", "json", "query", text, "--k", "4"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let results: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ranked = results
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["path"].as_str().unwrap().to_string(),
+                r["score"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    (ranked, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// Real model: `sync`/`query` in a `native:` workspace use a running
+/// server for the same instance (found through the default state dir) and
+/// rank exactly like the in-process engine.
+#[test]
+#[ignore = "live: loads native:Qwen/Qwen3-Embedding-0.6B; run with --ignored"]
+fn live_sync_and_query_discover_a_running_server() {
+    let served = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    for root in [served.path(), local.path()] {
+        write_corpus(root);
+        minsync(root).arg("init").assert().success();
+    }
+    // Default state dir, so discovery needs no configuration.
+    let mut server = std::process::Command::new(assert_cmd::cargo::cargo_bin("minsync"))
+        .current_dir(served.path())
+        .args(["--format", "json", "serve", "--idle-timeout", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(server.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let event: Value = serde_json::from_str(&line).unwrap();
+    assert!(
+        matches!(event["event"].as_str(), Some("serving" | "adopted")),
+        "{event}"
+    );
+
+    let sync = minsync(served.path())
+        .arg("sync")
+        .env("MINSYNC_SERVER", "on")
+        .output()
+        .unwrap();
+    assert!(sync.status.success(), "{sync:?}");
+    assert!(
+        String::from_utf8_lossy(&sync.stderr).contains("using running minsync serve"),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    minsync(local.path())
+        .arg("sync")
+        .env("MINSYNC_SERVER", "off")
+        .assert()
+        .success();
+
+    for text in [
+        "memory safe systems language",
+        "발효 음식",
+        "galaxy observation",
+    ] {
+        let (remote, stderr) = query_json(served.path(), "on", text);
+        assert!(stderr.contains("using running minsync serve"), "{stderr}");
+        let (in_process, stderr) = query_json(local.path(), "off", text);
+        assert!(!stderr.contains("using running minsync serve"), "{stderr}");
+        assert_eq!(
+            remote.iter().map(|r| &r.0).collect::<Vec<_>>(),
+            in_process.iter().map(|r| &r.0).collect::<Vec<_>>(),
+            "{text}"
+        );
+        for ((_, a), (_, b)) in remote.iter().zip(&in_process) {
+            assert!((a - b).abs() < 1e-4, "{text}: {a} vs {b}");
+        }
+    }
+
+    if event["event"] == "serving" {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(server.id() as i32, libc::SIGTERM)
+        };
+        #[cfg(not(unix))]
+        server.kill().unwrap();
+    }
+    let _ = server.wait();
+}

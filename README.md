@@ -437,6 +437,8 @@ minsync serve --port 8089 --idle-timeout 600
 - `pid`, `host` and `port` files live in `~/.cache/minsync/serve/<model instance>/` (override with `--state-dir`). A second `minsync serve` for the same model, device, dtype, attention and `max_length` finds the running server, prints it (`"event": "adopted"` with `--format json`) and exits without loading the model.
 - After `--idle-timeout` seconds (default 300; `0` disables) without an embedding request the server exits and frees the model. `SIGTERM`/Ctrl-C stop it cleanly; both remove the discovery files.
 
+`native:` workspaces use a running server automatically: `sync`, `query`, `check`, `verify` and `watch` look for the discovery files of the same model instance on their first embedding call and send the text there (with the workspace's prefixes, truncated at `max_length` like the in-process engine). With no server, or once it stops answering, they embed in-process as before. A warm server takes `query` from ~2.3 s / 2.4 GB to ~0.22 s / 59 MB on an M-series Mac. `MINSYNC_SERVER=off` always embeds in-process. The server must use the default `--state-dir` to be discovered.
+
 Point any TEI or OpenAI-compatible client at it, e.g. a second workspace:
 
 ```toml

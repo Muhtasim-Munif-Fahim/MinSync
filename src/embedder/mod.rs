@@ -3,6 +3,7 @@ pub mod native;
 pub mod openai;
 mod qwen3;
 pub mod retry;
+pub mod served;
 pub mod tei;
 
 use crate::config::Config;
@@ -106,7 +107,11 @@ pub fn create_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
             .with_truncate(settings.truncate);
         Ok(Box::new(embedder))
     } else if id.starts_with("native:") {
-        Ok(Box::new(native::NativeEmbedder::from_config(settings)?))
+        if served::server_disabled() {
+            Ok(Box::new(native::NativeEmbedder::from_config(settings)?))
+        } else {
+            Ok(Box::new(served::ServedEmbedder::from_config(settings)?))
+        }
     } else {
         Err(MinSyncError::Config(format!("unknown embedder id: {id}")))
     }
