@@ -114,8 +114,8 @@ ANN/FTS threshold와 unindexed delta 동작은 live index test가 검증합니�
 
 한국어 tokenizer에는 공식 Kiwi native library와 base model이 필요합니다.
 `KIWI_LIBRARY_PATH`는 `libkiwi`, `KIWI_MODEL_PATH`는 압축 해제한
-`models/cong/base`를 가리켜야 합니다. 수정된 crates.io release가 나오기
-전까지 MinSync는 `JAICHANGPARK/kiwi-rs`의 ABI 수정 commit을 고정합니다.
+`models/cong/base`를 가리켜야 합니다. `kiwi-rs`(LGPL-2.1-or-later)는 정적으로
+링크되며, 고지와 수정본으로 다시 링크하는 방법은 `THIRD_PARTY_NOTICES.md`를 참고하세요.
 macOS/Linux에서는 `bash scripts/install-kiwi.sh`가 공식 자산을 내려받고
 필요한 환경변수를 출력합니다.
 Windows에서는 `powershell -ExecutionPolicy Bypass -File
