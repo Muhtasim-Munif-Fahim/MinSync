@@ -127,8 +127,8 @@ machine-specific latency SLO.
 
 Korean tokenization requires the official Kiwi native library and base model.
 Set `KIWI_LIBRARY_PATH` to `libkiwi` and `KIWI_MODEL_PATH` to the extracted
-`models/cong/base` directory. MinSync pins the unreleased ABI fix from
-`JAICHANGPARK/kiwi-rs` until a corrected crates.io release is available.
+`models/cong/base` directory. `kiwi-rs` (LGPL-2.1-or-later) is statically linked;
+see `THIRD_PARTY_NOTICES.md` for its notice and how to relink against a modified copy.
 On macOS/Linux, `bash scripts/install-kiwi.sh` downloads the matching official
 assets and prints the required environment variables.
 On Windows, run `powershell -ExecutionPolicy Bypass -File
