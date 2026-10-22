@@ -182,7 +182,11 @@ pub struct EmbedderConfig {
     /// `eager` is the reference implementation. Ignored by `openai:` / `tei:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
-    /// Native tokenizer max length in tokens. Ignored by `openai:` / `tei:`.
+    /// Model context length in tokens. The native embedder truncates at it
+    /// with its own tokenizer (default 2048). For `openai:` / `tei:` inputs are
+    /// cut below it before sending, using a conservative per-character estimate;
+    /// unset, a documented default is used for well-known models and nothing is
+    /// cut for unknown ones.
     #[serde(default)]
     pub max_length: Option<usize>,
     /// Native embedder only: cap on padded tokens (`inputs x longest input`)

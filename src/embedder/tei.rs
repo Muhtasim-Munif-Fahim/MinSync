@@ -1,3 +1,4 @@
+use crate::embedder::context_limit::InputLimit;
 use crate::embedder::openai::{build_client, DEFAULT_REQUEST_TIMEOUT};
 use crate::embedder::retry::{
     classify_send_error, classify_status, embed_adaptive, RequestError, RetryPolicy,
@@ -23,6 +24,7 @@ pub struct TeiEmbedder {
     passage_prefix: Option<String>,
     truncate: bool,
     client: reqwest::Client,
+    limit: InputLimit,
 }
 
 #[derive(Serialize)]
@@ -49,6 +51,7 @@ impl TeiEmbedder {
             passage_prefix: None,
             truncate: false,
             client: build_client(DEFAULT_REQUEST_TIMEOUT),
+            limit: InputLimit::for_model(model, None),
         }
     }
 
@@ -81,6 +84,24 @@ impl TeiEmbedder {
     pub fn with_passage_prefix(mut self, p: Option<String>) -> Self {
         self.passage_prefix = p;
         self
+    }
+
+    /// Cut inputs below `max_length` tokens (`None` keeps the model table's
+    /// documented default, or no cut for an unknown model). Independent of
+    /// the server-side `truncate` flag.
+    pub fn with_max_length(mut self, max_length: Option<usize>) -> Self {
+        self.limit = InputLimit::for_model(&self.model, max_length);
+        self
+    }
+
+    /// `text` as it is sent: passage prefix applied, then cut to the limit.
+    /// The prefix counts toward the budget, so it is cut with the text.
+    fn passage_input(&self, text: &str) -> String {
+        let full = match &self.passage_prefix {
+            Some(prefix) => format!("{prefix}{text}"),
+            None => text.to_string(),
+        };
+        self.limit.apply(&full).into_owned()
     }
 
     pub fn with_truncate(mut self, truncate: bool) -> Self {
@@ -143,6 +164,23 @@ impl Embedder for TeiEmbedder {
         &self.model
     }
 
+    async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
+        Ok(texts
+            .iter()
+            .filter(|text| {
+                let full = match &self.passage_prefix {
+                    Some(prefix) => format!("{prefix}{text}"),
+                    None => (*text).clone(),
+                };
+                self.limit.needs_cut(&full)
+            })
+            .count())
+    }
+
+    fn max_length(&self) -> Option<usize> {
+        self.limit.max_length()
+    }
+
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -156,15 +194,7 @@ impl Embedder for TeiEmbedder {
 
         let batches: Vec<Vec<String>> = texts
             .chunks(self.batch_size)
-            .map(|batch| {
-                batch
-                    .iter()
-                    .map(|text| match &self.passage_prefix {
-                        Some(prefix) => format!("{}{}", prefix, text),
-                        None => text.clone(),
-                    })
-                    .collect()
-            })
+            .map(|batch| batch.iter().map(|text| self.passage_input(text)).collect())
             .collect();
 
         let batch_results: Vec<Result<Vec<Vec<f32>>>> =
@@ -733,5 +763,54 @@ mod tests {
 
         assert!(error.to_string().contains("413"), "{error}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    // ---- issue #115: cut inputs below the model context -------------------
+
+    #[tokio::test]
+    async fn test_tei_input_longer_than_max_length_is_cut_and_counted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([[0.1], [0.2]])))
+            .mount(&server)
+            .await;
+        let embedder = TeiEmbedder::new("tei:acme/small-embed", &server.uri(), 10)
+            .with_passage_prefix(Some("passage: ".to_string()))
+            .with_max_length(Some(100));
+        let long = "a".repeat(5_000);
+
+        assert_eq!(
+            embedder
+                .count_truncated(&["short".to_string(), long.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        embedder
+            .embed(&["short".to_string(), long.clone()])
+            .await
+            .unwrap();
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        let inputs = body["inputs"].as_array().unwrap();
+        assert_eq!(inputs[0], "passage: short");
+        let sent = inputs[1].as_str().unwrap();
+        assert!(sent.starts_with("passage: a"));
+        assert!(sent.len() < long.len());
+        assert!(
+            crate::embedder::context_limit::estimate_tokens_upper(sent)
+                <= crate::embedder::context_limit::budget(100),
+            "the prefix counts toward the budget"
+        );
+    }
+
+    #[test]
+    fn test_tei_max_length_uses_the_model_table_when_unset() {
+        let known = TeiEmbedder::new("tei:intfloat/multilingual-e5-large", "http://x", 10);
+        assert_eq!(known.max_length(), Some(512));
+        let unknown = TeiEmbedder::new("tei:acme/mystery-embed-v9", "http://x", 10);
+        assert_eq!(unknown.max_length(), None);
     }
 }
