@@ -196,6 +196,11 @@ async fn test_watch_resilient_startup_reports_failure_and_retries() {
         .expect("watch exits");
 }
 
+/// Unavailable for the first `FLAKY_FAILING_CALLS` calls, healthy afterwards.
+/// A chunk is attempted up to `max_retries` (default 3) times, so an outage
+/// has to outlast that budget to fail the sync.
+const FLAKY_FAILING_CALLS: usize = 3;
+
 struct FlakyEmbedder {
     calls: Arc<AtomicUsize>,
 }
@@ -207,7 +212,7 @@ impl Embedder for FlakyEmbedder {
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < FLAKY_FAILING_CALLS {
             Err(MinSyncError::Embedding("backend unavailable".to_string()))
         } else {
             Ok(texts.iter().map(|_| vec![0.0; 8]).collect())

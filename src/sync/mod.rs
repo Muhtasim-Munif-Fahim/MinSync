@@ -2595,8 +2595,11 @@ mod tests {
         assert_eq!(error.exit_code(), 5, "{error}");
         assert!(error.to_string().contains("service unavailable"), "{error}");
         let calls = dying.calls.load(Ordering::SeqCst);
+        // 1 healthy + whole batch + per-file/bisect calls + 3 failing chunks x
+        // `max_retries` (3) attempts each; without the streak every remaining
+        // batch and chunk is retried (well over 30).
         assert!(
-            calls <= 10,
+            calls <= 14,
             "embedder was hit {calls} times; the run kept going after the outage"
         );
         assert_eq!(
@@ -2626,7 +2629,7 @@ mod tests {
 
         assert_eq!(error.exit_code(), 5, "{error}");
         let calls = dying.calls.load(Ordering::SeqCst);
-        assert!(calls <= 8, "embedder was hit {calls} times");
+        assert!(calls <= 13, "embedder was hit {calls} times");
         assert_eq!(store.all_paths().len(), 2);
     }
 
@@ -2645,5 +2648,194 @@ mod tests {
         assert_eq!(result.files_failed.len(), 1);
         assert_eq!(result.files_failed[0].path, "c-bad.txt");
         assert_eq!(result.files_processed, 4);
+    }
+
+    // ---- issue #114: a failed chunk counts once toward the systemic streak -
+
+    /// Rejects any `embed` call that contains a chunk with `BADCHUNK`, even
+    /// when the call also carries good chunks (a request-level failure such as
+    /// an over-limit token total). Records every call's size.
+    struct RejectsBadChunks {
+        calls: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl RejectsBadChunks {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn call_sizes(&self) -> Vec<usize> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for RejectsBadChunks {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.len());
+            if texts.iter().any(|text| text.contains("BADCHUNK")) {
+                return Err(MinSyncError::Embedding("request too large".into()));
+            }
+            MockEmbedder.embed(texts).await
+        }
+    }
+
+    /// A file whose first chunk is bad and whose other chunks are fine.
+    fn write_file_with_one_bad_chunk(dir: &TempDir, name: &str) {
+        std::fs::write(
+            dir.path().join(name),
+            format!("BADCHUNK {name} {MULTI_CHUNK} {MULTI_CHUNK} {MULTI_CHUNK}"),
+        )
+        .expect("write file with a bad chunk");
+    }
+
+    fn set_max_retries(sync: &MinSync, retries: usize) {
+        let path = sync.minsync_dir.join("config.toml");
+        let mut config = Config::load(&path).expect("load config");
+        config.embedder.max_retries = retries;
+        config.save(&path).expect("save config");
+    }
+
+    #[tokio::test]
+    async fn test_bad_chunks_in_adjacent_files_do_not_abort_a_healthy_run() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        // Four adjacent bad files, then good ones: with the per-file streak
+        // (limit 3) the run aborts before reaching the good files.
+        for name in ["a1.txt", "a2.txt", "a3.txt", "a4.txt"] {
+            write_file_with_one_bad_chunk(&dir, name);
+        }
+        for name in ["b1.txt", "b2.txt", "b3.txt"] {
+            std::fs::write(dir.path().join(name), format!("{MULTI_CHUNK} {name}"))
+                .expect("write good file");
+        }
+        init_sync(&sync);
+        set_batch_files(&sync, 25);
+        set_max_retries(&sync, 3);
+        let embedder = RejectsBadChunks::new();
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("bad chunks surrounded by good ones must not abort the run");
+
+        assert_eq!(
+            store.all_paths(),
+            vec!["b1.txt", "b2.txt", "b3.txt"],
+            "the good files are committed"
+        );
+        let mut failed: Vec<&str> = result
+            .files_failed
+            .iter()
+            .map(|failure| failure.path.as_str())
+            .collect();
+        failed.sort_unstable();
+        assert_eq!(failed, vec!["a1.txt", "a2.txt", "a3.txt", "a4.txt"]);
+        assert!(result.partial);
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_file_names_the_bad_chunk_and_keeps_its_good_chunks_out_of_the_store() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_file_with_one_bad_chunk(&dir, "a.txt");
+        std::fs::write(dir.path().join("z.txt"), format!("{MULTI_CHUNK} z")).expect("write");
+        init_sync(&sync);
+        set_max_retries(&sync, 2);
+        let embedder = RejectsBadChunks::new();
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync completes");
+
+        assert_eq!(result.files_failed.len(), 1);
+        assert_eq!(result.files_failed[0].path, "a.txt");
+        assert_eq!(result.files_failed[0].stage, FileStage::Embed);
+        assert!(
+            result.files_failed[0].error.contains("chunk 0"),
+            "the report points at the bad chunk: {}",
+            result.files_failed[0].error
+        );
+        assert_eq!(
+            store.all_paths(),
+            vec!["z.txt"],
+            "a partly embedded file is not written"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_bad_chunk_is_attempted_max_retries_times_and_counts_once() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        write_file_with_one_bad_chunk(&dir, "a.txt");
+        init_sync(&sync);
+        set_max_retries(&sync, 3);
+        let embedder = RejectsBadChunks::new();
+
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("a single bad chunk is a skipped file, not an abort");
+
+        let single_chunk_calls = embedder.call_sizes().iter().filter(|&&n| n == 1).count();
+        assert_eq!(
+            single_chunk_calls,
+            3,
+            "the bad chunk is sent alone exactly max_retries times: {:?}",
+            embedder.call_sizes()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_every_chunk_failing_is_an_outage_and_aborts_after_three_chunks() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        for index in 0..10 {
+            std::fs::write(
+                dir.path().join(format!("f{index}.txt")),
+                format!("BADCHUNK {index}"),
+            )
+            .expect("write");
+        }
+        init_sync(&sync);
+        set_max_retries(&sync, 1);
+        let embedder = RejectsBadChunks::new();
+
+        let error = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect_err("three failed chunks in a row abort the run");
+
+        assert_eq!(error.exit_code(), 5, "{error}");
+        let calls = embedder.call_sizes().len();
+        assert!(
+            calls <= 8,
+            "the embedder was hit {calls} times after the outage began"
+        );
+    }
+
+    /// Fails every call that carries more than one chunk or a `BADCHUNK`
+    /// chunk, so a lone good chunk succeeds between failures.
+    #[tokio::test]
+    async fn test_a_good_chunk_between_bad_chunks_resets_the_streak() {
+        let (dir, sync, chunker, _embedder, mut store) = fixture();
+        // Each file: one bad chunk then good text. Isolation embeds the good
+        // chunks alone (success) between the bad ones, so the streak never
+        // reaches three even with five bad files.
+        for index in 0..5 {
+            write_file_with_one_bad_chunk(&dir, &format!("f{index}.txt"));
+        }
+        init_sync(&sync);
+        set_batch_files(&sync, 1);
+        set_max_retries(&sync, 1);
+        let embedder = RejectsBadChunks::new();
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("interleaved successes keep the run alive");
+
+        assert_eq!(result.files_failed.len(), 5);
+        assert!(store.all_paths().is_empty());
     }
 }

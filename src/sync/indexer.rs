@@ -62,19 +62,155 @@ enum Prepared<'a> {
     File(PreparedFile<'a>),
 }
 
-/// Consecutive embed/store failures (across files and batches, reset by any
-/// success) after which the per-file retry concludes the failure is systemic
-/// and aborts the run. Already-committed batches stay in `progress.jsonl`.
+/// Consecutive failures (across files and batches, reset by any success)
+/// after which the per-file retry concludes the failure is systemic and
+/// aborts the run. Already-committed batches stay in `progress.jsonl`.
+///
+/// An embed failure is narrowed down to chunks (see [`embed_isolating`]) and
+/// each chunk that fails all of its attempts counts **once**; a store failure
+/// counts once per file.
 const SYSTEMIC_STREAK: usize = 3;
 
 /// An error tagged with the pipeline stage that produced it.
 struct StageError {
     stage: FileStage,
     error: MinSyncError,
+    /// The embed step already updated the systemic streak chunk by chunk, so
+    /// the caller must not count this failure again.
+    counted: bool,
+    /// The streak limit was reached inside the embed step: abort the run.
+    abort: bool,
 }
 
 fn at(stage: FileStage) -> impl Fn(MinSyncError) -> StageError {
-    move |error| StageError { stage, error }
+    move |error| StageError {
+        stage,
+        error,
+        counted: false,
+        abort: false,
+    }
+}
+
+/// How a failing embed call is narrowed down to the chunks that cause it.
+pub(super) struct Isolation<'a> {
+    /// Failed chunks in a row over the whole run; owned by the caller.
+    pub streak: &'a mut usize,
+    /// Failed chunks in a row after which the run aborts.
+    pub limit: usize,
+    /// Error of an identical whole-call attempt that already failed, so the
+    /// same request is not sent again.
+    pub known_failure: Option<MinSyncError>,
+}
+
+enum IsolatedFailure {
+    /// The streak limit (or a deadline) was hit: abort the run.
+    Abort(MinSyncError),
+    /// At least one chunk stayed bad: the file fails, the run goes on.
+    Chunk(MinSyncError),
+}
+
+/// Prefix an embedding error with the position of the chunk it is about.
+fn with_chunk(error: MinSyncError, chunk: usize) -> MinSyncError {
+    match error {
+        MinSyncError::Embedding(message) => {
+            MinSyncError::Embedding(format!("chunk {chunk}: {message}"))
+        }
+        other => other,
+    }
+}
+
+/// Embed `texts`, narrowing a failing call down to the chunks that cause it.
+///
+/// A failing call over several chunks is halved and each half retried, so a
+/// request-level failure (an over-limit token total, one input the server
+/// rejects) costs about `2 * log2(n)` extra calls instead of `n`. A single
+/// chunk is attempted `attempt_limit` times in total. A chunk that fails all
+/// its attempts counts **once** toward the systemic streak; any successful
+/// call resets the streak. When the streak reaches `limit` the failure is
+/// systemic (embedder down, bad key) and the run aborts. A deadline
+/// ([`MinSyncError::Timeout`]) always aborts: the embedder is stuck.
+///
+/// Every chunk is tried, so one report names every bad chunk of the file.
+async fn embed_isolating(
+    embedder: &dyn Embedder,
+    texts: &[String],
+    attempt_limit: usize,
+    isolation: &mut Isolation<'_>,
+    located: &[(&Document, usize)],
+) -> std::result::Result<Vec<Vec<f32>>, IsolatedFailure> {
+    let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+    let mut first_failure: Option<MinSyncError> = None;
+    let mut known = isolation.known_failure.take();
+    let mut stack = Vec::with_capacity(texts.len().max(1));
+    stack.push(0..texts.len());
+    while let Some(range) = stack.pop() {
+        let whole = range.start == 0 && range.end == texts.len();
+        let outcome = match (whole, known.take()) {
+            (true, Some(error)) => Err(error),
+            _ => embedder.embed(&texts[range.clone()]).await,
+        };
+        let error = match outcome {
+            Ok(embedded) if embedded.len() == range.len() => {
+                *isolation.streak = 0;
+                for (slot, vector) in vectors[range.clone()].iter_mut().zip(embedded) {
+                    *slot = Some(vector);
+                }
+                continue;
+            }
+            Ok(embedded) => {
+                return Err(IsolatedFailure::Abort(MinSyncError::Embedding(format!(
+                    "expected {} embeddings, got {}",
+                    range.len(),
+                    embedded.len()
+                ))));
+            }
+            Err(error @ MinSyncError::Timeout(_)) => return Err(IsolatedFailure::Abort(error)),
+            Err(error) => error,
+        };
+        if range.len() > 1 {
+            let middle = range.start + range.len() / 2;
+            stack.push(middle..range.end);
+            stack.push(range.start..middle);
+            continue;
+        }
+        // A single chunk: the call above was attempt 1.
+        let index = range.start;
+        let mut last = error;
+        let mut recovered = false;
+        for _ in 1..attempt_limit {
+            match embedder.embed(&texts[range.clone()]).await {
+                Ok(embedded) if embedded.len() == 1 => {
+                    vectors[index] = embedded.into_iter().next();
+                    recovered = true;
+                    break;
+                }
+                Ok(_) => {
+                    last =
+                        MinSyncError::Embedding("expected 1 embedding, got another count".into());
+                }
+                Err(error @ MinSyncError::Timeout(_)) => {
+                    return Err(IsolatedFailure::Abort(error));
+                }
+                Err(error) => last = error,
+            }
+        }
+        if recovered {
+            *isolation.streak = 0;
+            continue;
+        }
+        *isolation.streak += 1;
+        let failure = with_chunk(last, located[index].1);
+        if *isolation.streak >= isolation.limit {
+            return Err(IsolatedFailure::Abort(failure));
+        }
+        if first_failure.is_none() {
+            first_failure = Some(failure);
+        }
+    }
+    if let Some(failure) = first_failure {
+        return Err(IsolatedFailure::Chunk(failure));
+    }
+    Ok(vectors.into_iter().flatten().collect())
 }
 
 fn path_filter(source_id: &str, paths: Vec<String>) -> Filter {
@@ -231,7 +367,8 @@ pub(super) async fn index_batch(
     }
 
     let prepared_items: Vec<&BatchItem> = prepared.iter().map(|file| file.item).collect();
-    match commit(prepared, &delete_paths, &mut context, result).await {
+    let batch_chunks: usize = prepared.iter().map(|file| file.chunks.len()).sum();
+    match commit(prepared, &delete_paths, &mut context, result, None).await {
         Ok(()) => {
             if !prepared_items.is_empty() {
                 *systemic_streak = 0;
@@ -258,46 +395,77 @@ pub(super) async fn index_batch(
             } else {
                 SYSTEMIC_STREAK
             };
-            // With one file and nothing else to write, a per-file retry would
-            // repeat the identical commit: reuse the failure we already have.
+            // The same rule counted in chunks: with nothing committed yet,
+            // failing every chunk of the batch is enough, so a lone failing
+            // chunk still aborts, but one bad chunk among good ones does not.
+            let chunk_limit = if nothing_succeeded {
+                batch_chunks.clamp(1, SYSTEMIC_STREAK)
+            } else {
+                SYSTEMIC_STREAK
+            };
+            // With one file and nothing else to write, the batch commit was
+            // already this file's whole embed call: do not send it again.
             let mut first_failure =
                 (prepared_items.len() == 1 && delete_paths.is_empty()).then_some(failure);
             for item in prepared_items {
-                let outcome = if let Some(failure) = first_failure.take() {
-                    Err(failure)
-                } else {
-                    match prepare_file(root, item, &context).await {
-                        Ok(Prepared::File(file)) => {
-                            commit(vec![file], &[], &mut context, result).await
+                let outcome = match first_failure.take() {
+                    // Not an embed failure: a retry would repeat it as is.
+                    Some(failure) if failure.stage != FileStage::Embed => Err(failure),
+                    known => {
+                        let mut isolation = Isolation {
+                            streak: &mut *systemic_streak,
+                            limit: chunk_limit,
+                            known_failure: known.map(|failure| failure.error),
+                        };
+                        match prepare_file(root, item, &context).await {
+                            Ok(Prepared::File(file)) => {
+                                commit(vec![file], &[], &mut context, result, Some(&mut isolation))
+                                    .await
+                            }
+                            Ok(Prepared::Gone) => {
+                                commit(
+                                    Vec::new(),
+                                    std::slice::from_ref(&item.path),
+                                    &mut context,
+                                    result,
+                                    None,
+                                )
+                                .await
+                            }
+                            Err(failure) => Err(failure),
                         }
-                        Ok(Prepared::Gone) => {
-                            commit(
-                                Vec::new(),
-                                std::slice::from_ref(&item.path),
-                                &mut context,
-                                result,
-                            )
-                            .await
-                        }
-                        Err(failure) => Err(failure),
                     }
                 };
                 match outcome {
                     Ok(()) => *systemic_streak = 0,
                     Err(failure) => {
-                        let systemic = matches!(failure.stage, FileStage::Embed | FileStage::Store);
-                        *systemic_streak = if systemic { *systemic_streak + 1 } else { 0 };
-                        if *systemic_streak >= streak_limit {
+                        if failure.abort {
                             result.files_failed.truncate(failed_before);
                             return Err(with_path(failure.error, &item.path));
+                        }
+                        // A chunk-level embed failure already moved the streak.
+                        if !failure.counted {
+                            let systemic =
+                                matches!(failure.stage, FileStage::Embed | FileStage::Store);
+                            *systemic_streak = if systemic { *systemic_streak + 1 } else { 0 };
+                            if *systemic_streak >= streak_limit {
+                                result.files_failed.truncate(failed_before);
+                                return Err(with_path(failure.error, &item.path));
+                            }
                         }
                         record_failure(skip, &item.path, failure, result)?;
                     }
                 }
             }
             for path in &delete_paths {
-                if let Err(failure) =
-                    commit(Vec::new(), std::slice::from_ref(path), &mut context, result).await
+                if let Err(failure) = commit(
+                    Vec::new(),
+                    std::slice::from_ref(path),
+                    &mut context,
+                    result,
+                    None,
+                )
+                .await
                 {
                     record_failure(skip, path, failure, result)?;
                 }
@@ -327,6 +495,7 @@ async fn commit(
     delete_paths: &[String],
     context: &mut SyncFileContext<'_>,
     result: &mut SyncResult,
+    isolation: Option<&mut Isolation<'_>>,
 ) -> std::result::Result<(), StageError> {
     let source_id = context.config.source_id.as_str();
     let schema_id = context.chunker.schema_id();
@@ -423,7 +592,36 @@ async fn commit(
                 .iter()
                 .map(|&index| docs_to_embed[index].text.clone())
                 .collect();
-            let mut embeddings = context.embedder.embed(&texts).await.map_err(&embed_stage)?;
+            let located: Vec<(&Document, usize)> = to_embed
+                .iter()
+                .map(|&index| (&docs_to_embed[index], chunk_in_file[index]))
+                .collect();
+            let mut embeddings = match isolation {
+                Some(isolation) => {
+                    let attempts = if context.embedder.is_deterministic() {
+                        1
+                    } else {
+                        context.config.embedder.max_retries.max(1)
+                    };
+                    embed_isolating(context.embedder, &texts, attempts, isolation, &located)
+                        .await
+                        .map_err(|failure| match failure {
+                            IsolatedFailure::Abort(error) => StageError {
+                                stage: FileStage::Embed,
+                                error,
+                                counted: true,
+                                abort: true,
+                            },
+                            IsolatedFailure::Chunk(error) => StageError {
+                                stage: FileStage::Embed,
+                                error,
+                                counted: true,
+                                abort: false,
+                            },
+                        })?
+                }
+                None => context.embedder.embed(&texts).await.map_err(&embed_stage)?,
+            };
             if embeddings.len() != texts.len() {
                 return Err(embed_stage(MinSyncError::Embedding(format!(
                     "expected {} embeddings, got {}",
@@ -431,10 +629,6 @@ async fn commit(
                     embeddings.len()
                 ))));
             }
-            let located: Vec<(&Document, usize)> = to_embed
-                .iter()
-                .map(|&index| (&docs_to_embed[index], chunk_in_file[index]))
-                .collect();
             repair_non_finite_embeddings(
                 context.embedder,
                 &texts,
