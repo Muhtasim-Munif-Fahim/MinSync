@@ -87,7 +87,7 @@ impl TeiEmbedder {
     }
 
     /// Cut inputs below `max_length` tokens (`None` keeps the model table's
-    /// documented default, or no cut for an unknown model). Independent of
+    /// documented default, or 8192 tokens for an unknown model). Independent of
     /// the server-side `truncate` flag.
     pub fn with_max_length(mut self, max_length: Option<usize>) -> Self {
         self.limit = InputLimit::for_model(&self.model, max_length);
@@ -811,6 +811,6 @@ mod tests {
         let known = TeiEmbedder::new("tei:intfloat/multilingual-e5-large", "http://x", 10);
         assert_eq!(known.max_length(), Some(512));
         let unknown = TeiEmbedder::new("tei:acme/mystery-embed-v9", "http://x", 10);
-        assert_eq!(unknown.max_length(), None);
+        assert_eq!(unknown.max_length(), Some(8192));
     }
 }

@@ -280,7 +280,7 @@ mod factory_tests {
         let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
         config.embedder.id = "tei:acme/mystery-embed-v9".to_string();
         config.embedder.base_url = Some("http://localhost:9999".to_string());
-        assert_eq!(create_embedder(&config).unwrap().max_length(), None);
+        assert_eq!(create_embedder(&config).unwrap().max_length(), Some(8192));
 
         config.embedder.max_length = Some(384);
         assert_eq!(create_embedder(&config).unwrap().max_length(), Some(384));

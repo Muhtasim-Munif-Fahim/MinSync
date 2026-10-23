@@ -64,9 +64,14 @@ pub fn truncate_to_budget(text: &str, budget: usize) -> Cow<'_, str> {
     Cow::Borrowed(text)
 }
 
+/// Context length assumed for a model that is neither in the table nor given an
+/// explicit `max_length`: the largest context of a mainstream embedding model.
+pub const UNKNOWN_MODEL_MAX_LENGTH: usize = 8192;
+
 /// Documented context length (tokens) of well-known embedding models, matched
 /// on the model id without its provider scheme. The longest key that the id
-/// contains wins. An unknown model has no entry and is never cut.
+/// contains wins. An unknown model has no entry; `InputLimit` then assumes
+/// [`UNKNOWN_MODEL_MAX_LENGTH`].
 ///
 /// Values are the models' published context lengths (the lower figure where
 /// two sources differ): OpenRouter's embeddings catalog for the hosted models
@@ -112,10 +117,15 @@ pub struct InputLimit {
 }
 
 impl InputLimit {
-    /// Limit for `model_id`: an explicit `max_length` wins over the table.
+    /// Limit for `model_id`: an explicit `max_length` wins over the table, and a
+    /// model in neither is assumed to hold [`UNKNOWN_MODEL_MAX_LENGTH`] tokens.
     pub fn for_model(model_id: &str, explicit: Option<usize>) -> Self {
         Self {
-            max_length: explicit.or_else(|| default_max_length(model_id)),
+            max_length: Some(
+                explicit
+                    .or_else(|| default_max_length(model_id))
+                    .unwrap_or(UNKNOWN_MODEL_MAX_LENGTH),
+            ),
         }
     }
 
@@ -162,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_models_have_no_default() {
+    fn unknown_models_have_no_table_entry() {
         assert_eq!(default_max_length("openai:acme/mystery-embed-v9"), None);
         assert_eq!(default_max_length(""), None);
     }

@@ -69,7 +69,7 @@ impl OpenAiEmbedder {
     }
 
     /// Cut inputs below `max_length` tokens (`None` keeps the model table's
-    /// documented default, or no cut for an unknown model).
+    /// documented default, or 8192 tokens for an unknown model).
     pub fn with_max_length(mut self, max_length: Option<usize>) -> Self {
         self.limit = InputLimit::for_model(&self.model, max_length);
         self
@@ -668,14 +668,14 @@ mod tests {
         let embedder = OpenAiEmbedder::new("openai:intfloat/multilingual-e5-large", "k", 10);
         assert_eq!(embedder.max_length(), Some(512));
         let unknown = OpenAiEmbedder::new("openai:acme/mystery-embed-v9", "k", 10);
-        assert_eq!(unknown.max_length(), None);
+        assert_eq!(unknown.max_length(), Some(8192));
         let explicit =
             OpenAiEmbedder::new("openai:acme/mystery-embed-v9", "k", 10).with_max_length(Some(256));
         assert_eq!(explicit.max_length(), Some(256));
     }
 
     #[tokio::test]
-    async fn test_unknown_model_without_max_length_is_never_cut() {
+    async fn test_unknown_model_without_max_length_is_cut_at_8k_context() {
         let server = echo_server().await;
         let embedder = OpenAiEmbedder::new("acme/mystery-embed-v9", "test-key", 10)
             .with_base_url(&server.uri());
@@ -684,7 +684,11 @@ mod tests {
         embedder.embed(std::slice::from_ref(&long)).await.unwrap();
 
         let sent = sent_inputs(&server.received_requests().await.unwrap());
-        assert_eq!(sent[0][0], long);
+        assert!(sent[0][0].len() < long.len());
+        assert!(
+            crate::embedder::context_limit::estimate_tokens_upper(&sent[0][0])
+                <= crate::embedder::context_limit::budget(8192)
+        );
     }
 
     #[tokio::test]
@@ -694,8 +698,8 @@ mod tests {
         let texts = vec!["short".to_string(), "b".repeat(5_000), "c".repeat(5_000)];
 
         assert_eq!(embedder.count_truncated(&texts).await.unwrap(), 2);
-        let unlimited = OpenAiEmbedder::new("acme/mystery-embed-v9", "test-key", 10);
-        assert_eq!(unlimited.count_truncated(&texts).await.unwrap(), 0);
+        let unknown = OpenAiEmbedder::new("acme/mystery-embed-v9", "test-key", 10);
+        assert_eq!(unknown.count_truncated(&texts).await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -185,8 +185,8 @@ pub struct EmbedderConfig {
     /// Model context length in tokens. The native embedder truncates at it
     /// with its own tokenizer (default 2048). For `openai:` / `tei:` inputs are
     /// cut below it before sending, using a conservative per-character estimate;
-    /// unset, a documented default is used for well-known models and nothing is
-    /// cut for unknown ones.
+    /// unset, a documented default is used for well-known models and 8192 is
+    /// assumed for unknown ones.
     #[serde(default)]
     pub max_length: Option<usize>,
     /// Native embedder only: cap on padded tokens (`inputs x longest input`)
