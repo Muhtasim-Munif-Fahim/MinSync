@@ -1,3 +1,4 @@
+use crate::embedder::context_limit::InputLimit;
 use crate::embedder::retry::{
     classify_send_error, classify_status, embed_adaptive, RequestError, RetryPolicy,
 };
@@ -22,6 +23,7 @@ pub struct OpenAiEmbedder {
     retry: RetryPolicy,
     client: reqwest::Client,
     base_url: String,
+    limit: InputLimit,
 }
 
 pub(crate) fn build_client(timeout: Duration) -> reqwest::Client {
@@ -62,7 +64,15 @@ impl OpenAiEmbedder {
             retry: RetryPolicy::default(),
             client: build_client(DEFAULT_REQUEST_TIMEOUT),
             base_url: "https://api.openai.com".to_string(),
+            limit: InputLimit::for_model(model, None),
         }
+    }
+
+    /// Cut inputs below `max_length` tokens (`None` keeps the model table's
+    /// documented default, or 8192 tokens for an unknown model).
+    pub fn with_max_length(mut self, max_length: Option<usize>) -> Self {
+        self.limit = InputLimit::for_model(&self.model, max_length);
+        self
     }
 
     pub fn with_base_url(mut self, url: &str) -> Self {
@@ -147,6 +157,17 @@ impl Embedder for OpenAiEmbedder {
         &self.model
     }
 
+    async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
+        Ok(texts
+            .iter()
+            .filter(|text| self.limit.needs_cut(text))
+            .count())
+    }
+
+    fn max_length(&self) -> Option<usize> {
+        self.limit.max_length()
+    }
+
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -160,7 +181,12 @@ impl Embedder for OpenAiEmbedder {
 
         let batches: Vec<Vec<String>> = texts
             .chunks(self.batch_size)
-            .map(|batch| batch.to_vec())
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|text| self.limit.apply(text).into_owned())
+                    .collect()
+            })
             .collect();
         let batch_results: Vec<Result<Vec<Vec<f32>>>> =
             futures::stream::iter(batches.into_iter().map(|batch| self.embed_batch(batch)))
@@ -575,5 +601,126 @@ mod tests {
 
         assert!(error.to_string().contains("413"), "{error}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    // ---- issue #115: cut inputs below the model context -------------------
+
+    fn sent_inputs(requests: &[wiremock::Request]) -> Vec<Vec<String>> {
+        requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    async fn echo_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let data: Vec<_> = body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| json!({"embedding": [0.1, 0.2], "index": i}))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn test_input_longer_than_max_length_is_cut_before_sending() {
+        let server = echo_server().await;
+        let embedder = OpenAiEmbedder::new("acme/small-embed", "test-key", 10)
+            .with_base_url(&server.uri())
+            .with_max_length(Some(100));
+        let long = "a".repeat(5_000);
+
+        embedder
+            .embed(&["short".to_string(), long.clone()])
+            .await
+            .unwrap();
+
+        let sent = sent_inputs(&server.received_requests().await.unwrap());
+        assert_eq!(sent[0][0], "short");
+        assert!(sent[0][1].len() < long.len());
+        assert!(long.starts_with(&sent[0][1]));
+        assert!(
+            crate::embedder::context_limit::estimate_tokens_upper(&sent[0][1])
+                <= crate::embedder::context_limit::budget(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_known_model_gets_its_documented_context_by_default() {
+        let embedder = OpenAiEmbedder::new("openai:intfloat/multilingual-e5-large", "k", 10);
+        assert_eq!(embedder.max_length(), Some(512));
+        let unknown = OpenAiEmbedder::new("openai:acme/mystery-embed-v9", "k", 10);
+        assert_eq!(unknown.max_length(), Some(8192));
+        let explicit =
+            OpenAiEmbedder::new("openai:acme/mystery-embed-v9", "k", 10).with_max_length(Some(256));
+        assert_eq!(explicit.max_length(), Some(256));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_model_without_max_length_is_cut_at_8k_context() {
+        let server = echo_server().await;
+        let embedder = OpenAiEmbedder::new("acme/mystery-embed-v9", "test-key", 10)
+            .with_base_url(&server.uri());
+        let long = "a".repeat(50_000);
+
+        embedder.embed(std::slice::from_ref(&long)).await.unwrap();
+
+        let sent = sent_inputs(&server.received_requests().await.unwrap());
+        assert!(sent[0][0].len() < long.len());
+        assert!(
+            crate::embedder::context_limit::estimate_tokens_upper(&sent[0][0])
+                <= crate::embedder::context_limit::budget(8192)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_truncated_counts_only_inputs_that_will_be_cut() {
+        let embedder =
+            OpenAiEmbedder::new("acme/small-embed", "test-key", 10).with_max_length(Some(100));
+        let texts = vec!["short".to_string(), "b".repeat(5_000), "c".repeat(5_000)];
+
+        assert_eq!(embedder.count_truncated(&texts).await.unwrap(), 2);
+        let unknown = OpenAiEmbedder::new("acme/mystery-embed-v9", "test-key", 10);
+        assert_eq!(unknown.count_truncated(&texts).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_cut_input_keeps_its_position_and_vector_count() {
+        let server = echo_server().await;
+        let embedder = OpenAiEmbedder::new("acme/small-embed", "test-key", 2)
+            .with_base_url(&server.uri())
+            .with_max_length(Some(50));
+        let texts: Vec<String> = (0..5)
+            .map(|i| format!("{i}{}", "x".repeat(3_000)))
+            .collect();
+
+        let vectors = embedder.embed(&texts).await.unwrap();
+
+        assert_eq!(vectors.len(), 5);
+        let sent: Vec<String> = sent_inputs(&server.received_requests().await.unwrap())
+            .into_iter()
+            .flatten()
+            .collect();
+        for (i, text) in sent.iter().enumerate() {
+            assert!(text.starts_with(&i.to_string()), "order kept: {text:.4}");
+        }
     }
 }

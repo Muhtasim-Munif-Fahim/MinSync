@@ -1,3 +1,4 @@
+pub mod context_limit;
 pub mod deadline;
 pub mod native;
 pub mod openai;
@@ -128,7 +129,8 @@ pub fn create_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
         let mut embedder = openai::OpenAiEmbedder::from_env(id, settings.batch_size)?
             .with_timeout(timeout)
             .with_max_retries(settings.max_retries)
-            .with_max_concurrent(settings.max_concurrent);
+            .with_max_concurrent(settings.max_concurrent)
+            .with_max_length(settings.max_length);
         if let Some(base_url) = &settings.base_url {
             embedder = embedder.with_base_url(base_url);
         }
@@ -144,7 +146,8 @@ pub fn create_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
             .with_max_concurrent(settings.max_concurrent)
             .with_query_prefix(config.embedder.query_prefix.clone())
             .with_passage_prefix(config.embedder.passage_prefix.clone())
-            .with_truncate(settings.truncate);
+            .with_truncate(settings.truncate)
+            .with_max_length(settings.max_length);
         Ok(Box::new(embedder))
     } else if id.starts_with("native:") {
         if served::server_disabled() {
@@ -324,5 +327,22 @@ mod factory_tests {
 
         let result = create_embedder(&config);
         assert!(matches!(result, Err(MinSyncError::Config(_))));
+    }
+
+    #[test]
+    fn test_create_embedder_passes_configured_max_length_to_remote_embedders() {
+        let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
+        config.embedder.id = "tei:acme/mystery-embed-v9".to_string();
+        config.embedder.base_url = Some("http://localhost:9999".to_string());
+        assert_eq!(create_embedder(&config).unwrap().max_length(), Some(8192));
+
+        config.embedder.max_length = Some(384);
+        assert_eq!(create_embedder(&config).unwrap().max_length(), Some(384));
+
+        std::env::set_var("OPENAI_API_KEY", "test");
+        config.embedder.id = "openai:acme/mystery-embed-v9".to_string();
+        let embedder = create_embedder(&config);
+        std::env::remove_var("OPENAI_API_KEY");
+        assert_eq!(embedder.unwrap().max_length(), Some(384));
     }
 }
